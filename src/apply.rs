@@ -242,14 +242,24 @@ async fn apply_inner(db: &Db, imap: &mut Imap, account: &Account, cap: usize) ->
     if mode != Mode::Live || pending.is_empty() {
         return Ok(out);
     }
-    let listed = imap.list().await?;
+    let mut listed = imap.list().await?;
     let mut groups: BTreeMap<(String, i64), Vec<Pending>> = BTreeMap::new();
+    let mut early = Vec::new();
     for p in pending {
-        groups
-            .entry((p.imap_name.clone(), p.stored.uidvalidity))
-            .or_default()
-            .push(p);
+        // Settled without touching the server: a mailbox command on a
+        // deleted folder would fail every pass and never drain the queue.
+        if p.stored.gone {
+            early.push((p, Result1::Skipped(Reason::Gone)));
+        } else if !listed.iter().any(|m| m.imap_name == p.imap_name) {
+            early.push((p, Result1::Skipped(Reason::Missing)));
+        } else {
+            groups
+                .entry((p.imap_name.clone(), p.stored.uidvalidity))
+                .or_default()
+                .push(p);
+        }
     }
+    record(db, &account.name, early, &mut out).await?;
     for ((imap_name, _), items) in groups {
         let status = imap.status(&imap_name).await?;
         let validity = imap.select(&imap_name).await?.max(status.uidvalidity);
@@ -295,7 +305,7 @@ async fn apply_inner(db: &Db, imap: &mut Imap, account: &Account, cap: usize) ->
         for ((action, dest), batch) in by_target {
             for chunk in batch.chunks(MOVE_BATCH) {
                 let uids: Vec<u32> = chunk.iter().map(|p| p.uid).collect();
-                let r = execute(imap, &listed, &action, dest.as_deref(), &uids).await;
+                let r = execute(imap, &mut listed, &action, dest.as_deref(), &uids).await;
                 let result = |r: &Result<()>| match r {
                     Ok(()) => Ok(()),
                     Err(e) if is_server_refusal(e) => Err(format!("{e:#}")),
@@ -325,7 +335,7 @@ async fn apply_inner(db: &Db, imap: &mut Imap, account: &Account, cap: usize) ->
 
 async fn execute(
     imap: &mut Imap,
-    listed: &[MailboxInfo],
+    listed: &mut Vec<MailboxInfo>,
     action: &str,
     dest: Option<&str>,
     uids: &[u32],
@@ -355,6 +365,11 @@ async fn execute(
                 None => {
                     let encoded = utf7::encode(dest);
                     imap.create_mailbox(&encoded).await?;
+                    listed.push(MailboxInfo {
+                        name: dest.to_owned(),
+                        imap_name: encoded.clone(),
+                        flags: Vec::new(),
+                    });
                     encoded
                 }
             };
