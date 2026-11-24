@@ -13,6 +13,8 @@ mod similar;
 mod sync;
 mod telemetry;
 mod utf7;
+mod watch;
+mod web;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -185,7 +187,74 @@ async fn run(command: Command, config: Config) -> Result<()> {
                 );
             }
         }
+        Command::Serve => serve(db, config).await?,
         _ => anyhow::bail!("not implemented yet"),
+    }
+    Ok(())
+}
+
+async fn bind(addr: &str, name: &str) -> Result<tokio::net::TcpListener> {
+    let listener = tokio::net::TcpListener::bind(addr)
+        .await
+        .map_err(|e| anyhow::anyhow!("binding the {name} listener {addr}: {e}"))?;
+    tracing::info!("{name} listening on {addr}");
+    Ok(listener)
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = tokio::signal::ctrl_c();
+    #[cfg(unix)]
+    {
+        let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("SIGTERM handler");
+        tokio::select! {
+            _ = ctrl_c => {}
+            _ = term.recv() => {}
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = ctrl_c.await;
+}
+
+async fn serve(db: Db, config: Config) -> Result<()> {
+    let handle = metrics::install()?;
+    let metrics_listener = bind(&config.metrics_listen, "metrics").await?;
+    let listener = bind(&config.listen, "web").await?;
+    tokio::spawn(async move {
+        if let Err(e) = axum::serve(metrics_listener, metrics::router(handle)).await {
+            tracing::error!("metrics listener failed: {e}");
+        }
+    });
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    let watchers: Vec<_> = config
+        .accounts
+        .iter()
+        .cloned()
+        .map(|a| tokio::spawn(watch::run(db.clone(), a, config.write_cap, stopped.clone())))
+        .collect();
+    let app = web::router(db.clone(), &config);
+    let mut web_stopped = stopped.clone();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = web_stopped.changed().await;
+            })
+            .await
+    });
+    shutdown_signal().await;
+    tracing::info!("shutting down");
+    let _ = stop.send(true);
+    let drained = async {
+        for w in watchers {
+            let _ = w.await;
+        }
+        let _ = server.await;
+    };
+    if tokio::time::timeout(std::time::Duration::from_secs(30), drained)
+        .await
+        .is_err()
+    {
+        tracing::warn!("shutdown timed out");
     }
     Ok(())
 }
