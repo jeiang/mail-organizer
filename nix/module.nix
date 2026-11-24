@@ -43,7 +43,7 @@ in {
     listen = mkOption {
       type = types.str;
       default = "127.0.0.1:8490";
-      description = "Address of the read-only web UI.";
+      description = "Address of the web UI with rule editing; keep it on loopback.";
     };
 
     metricsListen = mkOption {

@@ -96,18 +96,36 @@ async fn session(
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<()> {
     let mut imap = Imap::connect(account).await?;
+    let mut refresh = db.refresh.subscribe();
     let mut trigger = "start";
     loop {
         // Baseline before the pass, so mail read while it runs triggers the next one.
         imap.select(INBOX).await?;
         let mut readable = imap.uid_search(READABLE).await?;
         pass(db, &mut imap, account, cap, trigger).await?;
+        let name = account.name.clone();
+        let queued = db
+            .read(move |c| {
+                Ok(db::mode(c)? == Mode::Live && c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM decisions WHERE account = ?1 AND apply_state = 'pending')",
+            [name], |r| r.get::<_, bool>(0))?)
+            })
+            .await?;
+        if queued {
+            tokio::time::sleep(SETTLE).await;
+            trigger = "queue";
+            continue;
+        }
         imap.select(INBOX).await?;
         let deadline = Instant::now() + TIMER;
         trigger = loop {
             let (next, changed) = tokio::select! {
                 r = imap.idle(deadline.min(Instant::now() + SLICE)) => r?,
                 _ = shutdown.changed() => return Ok(()),
+                _ = refresh.changed() => {
+                    imap = Imap::connect(account).await?;
+                    break "rules";
+                },
             };
             imap = next;
             if changed {
