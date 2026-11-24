@@ -156,6 +156,24 @@ async fn run(command: Command, config: Config) -> Result<()> {
                 );
             }
         }
+        Command::Rules {
+            command: RulesCommand::Export,
+        } => {
+            let doc = db.read(rules::export).await?;
+            println!("{}", serde_json::to_string_pretty(&doc)?);
+        }
+        Command::Rules {
+            command: RulesCommand::Import { file },
+        } => {
+            let text = if file == "-" {
+                std::io::read_to_string(std::io::stdin())?
+            } else {
+                std::fs::read_to_string(&file)?
+            };
+            let doc: serde_json::Value = serde_json::from_str(&text)?;
+            let n = db.write(move |c| rules::import(c, &doc)).await?;
+            println!("imported {n} rule(s)");
+        }
         _ => anyhow::bail!("not implemented yet"),
     }
     Ok(())
