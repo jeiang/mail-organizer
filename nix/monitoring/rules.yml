@@ -1,0 +1,29 @@
+---
+groups:
+  - name: mail-organizer
+    rules:
+      - alert: MailOrganizerPassStale
+        expr: >-
+          time() - mail_organizer_last_pass_success_timestamp_seconds > 3600
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            mail-organizer has not finished a pass for
+            {{ $labels.account }} in over an hour
+          description: >-
+            The last successful pass for {{ $labels.account }} was
+            {{ $value | humanizeDuration }} ago; check the mail-organizer
+            journal for IMAP errors.
+      - alert: MailOrganizerApplyFailing
+        expr: increase(mail_organizer_apply_total{result="failed"}[30m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            mail-organizer failed to move mail for {{ $labels.account }}
+          description: >-
+            {{ $value }} moves failed in the last 30 minutes for
+            {{ $labels.account }}; the reason is on the message page and
+            in the logs.

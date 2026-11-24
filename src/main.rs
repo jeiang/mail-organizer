@@ -3,14 +3,18 @@
 
 mod config;
 mod db;
+mod metrics;
+mod telemetry;
 
 use std::path::PathBuf;
+use std::process::ExitCode;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 use crate::config::Config;
 use crate::db::Db;
+use crate::telemetry::Telemetry;
 
 #[derive(Parser)]
 #[command(
@@ -71,11 +75,42 @@ enum RulesCommand {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> ExitCode {
     let cli = Cli::parse();
-    let config = Config::load(&cli.config)?;
+    let config = match Config::load(&cli.config) {
+        Ok(config) => config,
+        Err(e) => {
+            telemetry::init_tracing(None);
+            tracing::error!("{e:#}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let telemetry = match &cli.command {
+        Command::Serve => match Telemetry::start(&config.telemetry) {
+            Ok(t) => t,
+            Err(e) => {
+                telemetry::init_tracing(None);
+                tracing::error!("{e:#}");
+                return ExitCode::FAILURE;
+            }
+        },
+        _ => Telemetry::disabled(),
+    };
+    telemetry::init_tracing(telemetry.tracer());
+    let result = run(cli.command, config).await;
+    telemetry.shutdown();
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            tracing::error!("{e:#}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run(command: Command, config: Config) -> Result<()> {
     let db = Db::open(&config.db)?;
-    match cli.command {
+    match command {
         Command::Migrate => {
             let n = db.write(db::migrate).await?;
             println!("applied {n} migration(s)");

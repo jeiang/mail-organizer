@@ -29,7 +29,7 @@
 
     devShells = forAllSystems (pkgs: {
       default = pkgs.mkShell {
-        packages = with pkgs; [cargo rustc clippy rustfmt rust-analyzer sqlite sqlcipher prometheus jq];
+        packages = with pkgs; [cargo rustc clippy rustfmt rust-analyzer sqlite sqlcipher prometheus.cli jq];
       };
     });
 
