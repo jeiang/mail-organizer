@@ -145,11 +145,4 @@ impl Config {
             None => Ok(self.accounts.clone()),
         }
     }
-
-    pub fn preset(&self, account: &str) -> Option<Preset> {
-        self.accounts
-            .iter()
-            .find(|a| a.name == account)
-            .map(|a| a.preset)
-    }
 }

@@ -1,9 +1,7 @@
-// Removed once every module is wired into a command.
-#![allow(dead_code)]
-
 mod apply;
 mod config;
 mod db;
+mod eval;
 mod features;
 mod imap;
 mod metrics;
@@ -188,7 +186,36 @@ async fn run(command: Command, config: Config) -> Result<()> {
             }
         }
         Command::Serve => serve(db, config).await?,
-        _ => anyhow::bail!("not implemented yet"),
+        Command::Reindex => {
+            let n = db
+                .write(|c| {
+                    let tx = c.transaction()?;
+                    let ids: Vec<i64> = tx
+                        .prepare("SELECT rowid FROM message_fts")?
+                        .query_map([], |r| r.get(0))?
+                        .collect::<rusqlite::Result<_>>()?;
+                    for id in &ids {
+                        sync::reindex_one(&tx, *id)?;
+                    }
+                    tx.commit()?;
+                    Ok(ids.len())
+                })
+                .await?;
+            println!("reindexed {n} message(s)");
+        }
+        Command::Eval {
+            account,
+            limit,
+            no_similar,
+        } => {
+            for account in config.select(account.as_deref())? {
+                let name = account.name.clone();
+                let report = db
+                    .read(move |c| eval::evaluate(c, &name, limit, !no_similar))
+                    .await?;
+                eval::print(&account.name, !no_similar, &report);
+            }
+        }
     }
     Ok(())
 }

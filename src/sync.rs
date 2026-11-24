@@ -593,11 +593,8 @@ pub fn message_from_features(
         att_types: json_text(&f.att_types),
         att_names: json_text(&f.att_names),
         date_ts: f.date_ts,
-        in_inbox: state.in_inbox,
         folder: state.folder.clone(),
-        location: state.location.clone(),
         seen: state.seen,
-        flagged: state.flagged,
         ..Message::default()
     }
 }

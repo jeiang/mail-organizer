@@ -66,14 +66,6 @@ impl Db {
         })
         .await?
     }
-
-    pub fn blocking_write<T>(&self, f: impl FnOnce(&mut Connection) -> Result<T>) -> Result<T> {
-        let mut conn = self
-            .writer
-            .lock()
-            .map_err(|_| anyhow!("db writer poisoned"))?;
-        f(&mut conn)
-    }
 }
 
 pub fn migrate(conn: &mut Connection) -> Result<usize> {
