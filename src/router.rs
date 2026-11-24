@@ -38,7 +38,7 @@ pub fn decide(
             dest: rule.dest.clone(),
             key: Some(rule.id.clone()),
             confidence: None,
-            detail: json!({}),
+            detail: json!({"rule": rule}),
         });
     }
     if let Some(l) = rules::learned_match(c, m)? {
@@ -78,12 +78,16 @@ pub fn decide(
     })
 }
 
-/// Read, unflagged, received inbox mail with no decision yet.
+/// Read, unflagged inbox mail that has not been successfully filed or queued.
 pub fn eligible(c: &Connection, account: &str) -> Result<Vec<Message>> {
     let sql = format!(
-        "SELECT {MESSAGE_COLUMNS} FROM messages m WHERE m.account = ?1 AND m.in_inbox = 1 AND m.seen = 1 \
+        "SELECT {MESSAGE_COLUMNS} FROM messages m LEFT JOIN decisions latest \
+         ON latest.id = (SELECT MAX(d.id) FROM decisions d WHERE d.message_id = m.id) \
+         WHERE m.account = ?1 AND m.in_inbox = 1 AND m.seen = 1 \
          AND m.flagged = 0 AND m.sent = 0 AND m.gone_at IS NULL \
-         AND NOT EXISTS (SELECT 1 FROM decisions d WHERE d.message_id = m.id) ORDER BY m.id"
+         AND NOT EXISTS (SELECT 1 FROM decisions d WHERE d.message_id = m.id AND d.apply_state IN ('done', 'imported')) \
+         AND (latest.id IS NULL OR latest.apply_state IS NULL OR (latest.apply_state = 'skipped' \
+         AND latest.apply_error IN ('unseen', 'flagged', 'destination', 'rule_changed'))) ORDER BY m.id"
     );
     let mut stmt = c.prepare(&sql)?;
     let rows = stmt.query_map([account], Message::from_row)?;
@@ -141,6 +145,7 @@ pub async fn route_account(db: &Db, account: &str) -> Result<Routed> {
             let mode = db::mode(c)?;
             let pending = eligible(c, &account)?;
             let rules = rules::load(c, Some(&account))?;
+            let destinations = rules::destinations(c, &account)?;
             let now = db::now();
             let tx = c.transaction()?;
             let mut routed = Routed {
@@ -159,8 +164,23 @@ pub async fn route_account(db: &Db, account: &str) -> Result<Routed> {
                     mail.confidence = tracing::field::Empty,
                 );
                 let _e = span.enter();
-                let d = decide(&tx, m, &rules, now, true)?;
+                let mut d = decide(&tx, m, &rules, now, true)?;
+                if d.action == "file" && !d.dest.as_ref().is_some_and(|dest| destinations.contains(dest)) {
+                    d.detail = json!({"reason": "Destination is unavailable", "proposed": d.dest, "evidence": d.detail});
+                    d.stage = "none";
+                    d.action = "none";
+                    d.dest = None;
+                }
                 let state = (mode == Mode::Live && d.action != "none").then_some("pending");
+                let unchanged: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM decisions WHERE message_id = ?1
+                     AND id = (SELECT MAX(id) FROM decisions WHERE message_id = ?1)
+                     AND stage = ?2 AND action = ?3 AND dest IS ?4 AND key IS ?5 AND detail = ?6 AND apply_state IS ?7)",
+                    params![m.id, d.stage, d.action, d.dest, d.key, d.detail.to_string(), state], |r| r.get(0),
+                )?;
+                if unchanged {
+                    continue;
+                }
                 let id = record(&tx, m, &d, now, state)?;
                 let s = Span::current();
                 s.record("decision.id", id);
@@ -191,4 +211,104 @@ pub async fn route_account(db: &Db, account: &str) -> Result<Routed> {
     span.record("eligible", routed.eligible);
     span.record("decided", routed.by_stage.values().sum::<usize>());
     Ok(routed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture() -> Connection {
+        let mut c = Connection::open_in_memory().unwrap();
+        db::migrate(&mut c).unwrap();
+        c.execute_batch("INSERT INTO accounts(name,preset) VALUES ('test','icloud');
+            INSERT INTO mailboxes(id,account,name,imap_name,role) VALUES
+            (1,'test','INBOX','INBOX','inbox'),(2,'test','News','News','filed'),(3,'test','Misc','Misc','misc');
+            INSERT INTO messages(id,account,mailbox_id,uidvalidity,uid,digest,seen,in_inbox,location,from_addr,first_seen)
+            VALUES (1,'test',1,1,1,'inbox',1,1,'INBOX','news@example.com',1);").unwrap();
+        c
+    }
+
+    fn examples(c: &Connection, folder: &str, mailbox: i64) {
+        for id in 2..=4 {
+            c.execute("INSERT INTO messages(id,account,mailbox_id,uidvalidity,uid,digest,location,folder,from_addr,first_seen)
+                VALUES (?1,'test',?2,1,?1,?3,?4,?4,'news@example.com',1)",
+                params![id,mailbox,format!("example-{id}"),folder]).unwrap();
+        }
+    }
+
+    #[test]
+    fn unmatched_mail_is_reconsidered_after_new_examples() {
+        let c = fixture();
+        let m = eligible(&c, "test").unwrap().remove(0);
+        let d = decide(&c, &m, &[], 1.0, false).unwrap();
+        record(&c, &m, &d, 1.0, None).unwrap();
+        examples(&c, "News", 2);
+        let pending = eligible(&c, "test").unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            decide(&c, &pending[0], &[], 2.0, false)
+                .unwrap()
+                .dest
+                .as_deref(),
+            Some("News")
+        );
+    }
+
+    #[test]
+    fn misc_is_not_training_data() {
+        let c = fixture();
+        examples(&c, "Misc", 3);
+        let m = eligible(&c, "test").unwrap().remove(0);
+        assert!(rules::learned_match(&c, &m).unwrap().is_none());
+    }
+
+    #[test]
+    fn automatic_filing_does_not_confirm_itself() {
+        let c = fixture();
+        examples(&c, "News", 2);
+        let m = c
+            .query_row(
+                &format!("SELECT {MESSAGE_COLUMNS} FROM messages m WHERE id = 2"),
+                [],
+                Message::from_row,
+            )
+            .unwrap();
+        let d = Decision {
+            stage: "learned",
+            action: "file",
+            dest: Some("News".into()),
+            key: None,
+            confidence: None,
+            detail: json!({}),
+        };
+        record(&c, &m, &d, 2.0, Some("done")).unwrap();
+        let count: i64 = c
+            .query_row("SELECT COUNT(*) FROM training_messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 2);
+        c.execute(
+            "UPDATE messages SET folder = 'Personal', location = 'Personal' WHERE id = 2",
+            [],
+        )
+        .unwrap();
+        let count: i64 = c
+            .query_row("SELECT COUNT(*) FROM training_messages", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn specific_pattern_wins_over_dominant_sender() {
+        let c = fixture();
+        c.execute_batch("WITH RECURSIVE ids(i) AS (SELECT 2 UNION ALL SELECT i+1 FROM ids WHERE i < 101)
+            INSERT INTO messages(id,account,mailbox_id,uidvalidity,uid,digest,folder,from_addr,subject_tmpl,first_seen)
+            SELECT i,'test',2,1,i,'example-' || i,CASE WHEN i < 97 THEN 'News' ELSE 'Purchases' END,
+            'news@example.com',CASE WHEN i < 97 THEN 'newsletter' ELSE 'receipt' END,1 FROM ids;
+            UPDATE messages SET subject_tmpl = 'receipt' WHERE id = 1;").unwrap();
+        let m = eligible(&c, "test").unwrap().remove(0);
+        assert_eq!(
+            rules::learned_match(&c, &m).unwrap().unwrap().dest,
+            "Purchases"
+        );
+    }
 }

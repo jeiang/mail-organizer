@@ -1,5 +1,4 @@
-//! The similarity stage: FTS5 BM25 over metadata tokens, subject and body,
-//! replacing atrium's embedding kNN.
+//! FTS5 BM25 retrieval over metadata, subject, and body.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -72,7 +71,7 @@ pub fn neighbours(c: &Connection, m: &Message, k: usize) -> Result<Vec<Neighbour
     };
     let mut stmt = c.prepare_cached(
         "SELECT f.rowid, fm.folder, -bm25(message_fts, 5.0, 2.0, 1.0) AS s FROM message_fts f \
-         JOIN filed_messages fm ON fm.id = f.rowid \
+         JOIN training_messages fm ON fm.id = f.rowid \
          WHERE message_fts MATCH ?1 AND fm.account = ?2 AND fm.id != ?3 ORDER BY s DESC LIMIT ?4",
     )?;
     let rows = stmt.query_map(params![q, m.account, m.id, k as i64], |r| {

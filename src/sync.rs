@@ -1,5 +1,4 @@
-//! Mailbox roles, message state and the sync pass, ported from atrium's
-//! `role.go`, `sync/state.go` and `sync/sync.go`.
+//! Mailbox roles, message state, and synchronization.
 
 use std::collections::{HashMap, HashSet};
 
@@ -12,7 +11,7 @@ use crate::config::{Account, Preset};
 use crate::db::{self, Db};
 use crate::features::{self, Features};
 use crate::imap::{Fetched, Imap};
-use crate::rules::Message;
+use crate::rules::{self, Message};
 use crate::similar;
 use crate::utf7;
 
@@ -208,6 +207,18 @@ async fn sync_inner(db: &Db, imap: &mut Imap, account: &Account) -> Result<Stats
     .await?;
     let listed = imap.list().await?;
     let names: HashSet<String> = listed.iter().map(|m| m.name.clone()).collect();
+    let (folder_key, folder_names) = (
+        format!("folders:{}", account.name),
+        serde_json::to_string(
+            &listed
+                .iter()
+                .filter(|m| rules::filing_destination(&m.name))
+                .map(|m| &m.name)
+                .collect::<Vec<_>>(),
+        )?,
+    );
+    db.write(move |c| db::set_state(c, &folder_key, &folder_names))
+        .await?;
     let name = account.name.clone();
     stats.gone.extend(
         db.write(move |c| retire_mailboxes(c, &name, &names, run))

@@ -5,7 +5,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 
-const MIGRATIONS: &[&str] = &[include_str!("../schema/0001_init.sql")];
+const MIGRATIONS: &[&str] = &[
+    include_str!("../schema/0001_init.sql"),
+    include_str!("../schema/0002_training.sql"),
+];
 
 /// One writer connection, shared, and short-lived read connections. Every call
 /// runs on the blocking pool.
@@ -13,6 +16,8 @@ const MIGRATIONS: &[&str] = &[include_str!("../schema/0001_init.sql")];
 pub struct Db {
     path: PathBuf,
     writer: Arc<Mutex<Connection>>,
+    pub mutations: Arc<tokio::sync::Mutex<()>>,
+    pub refresh: tokio::sync::watch::Sender<()>,
 }
 
 fn configure(conn: &Connection) -> Result<()> {
@@ -32,6 +37,8 @@ impl Db {
         Ok(Self {
             path: path.to_owned(),
             writer: Arc::new(Mutex::new(conn)),
+            mutations: Arc::new(tokio::sync::Mutex::new(())),
+            refresh: tokio::sync::watch::channel(()).0,
         })
     }
 

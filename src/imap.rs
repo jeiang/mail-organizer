@@ -372,16 +372,6 @@ impl Imap {
         Ok(())
     }
 
-    pub async fn create_mailbox(&mut self, imap_name: &str) -> Result<()> {
-        timed(
-            &format!("CREATE {imap_name}"),
-            self.session.create(imap_name),
-        )
-        .await?;
-        let _ = timed("SUBSCRIBE", self.session.subscribe(imap_name)).await;
-        Ok(())
-    }
-
     /// Waits for a change in the selected mailbox, at most until `deadline`.
     /// Without IDLE, waits a minute and reports a change.
     pub async fn idle(mut self, deadline: Instant) -> Result<(Self, bool)> {

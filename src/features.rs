@@ -1,6 +1,4 @@
-//! Message features, ported from atrium's `features.go`. Regexes keep RE2's
-//! ASCII meaning of `\d`, `\w`, `\b` and `\s` so subject templates match the
-//! ones atrium stored.
+//! Parsed message features with ASCII regex character classes.
 
 use std::collections::BTreeSet;
 use std::sync::LazyLock;

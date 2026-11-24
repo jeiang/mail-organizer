@@ -55,7 +55,7 @@ enum Command {
     },
     /// Recompute the metadata tokens of every indexed message.
     Reindex,
-    /// Leave-one-out accuracy of the routing stages over filed mail.
+    /// Time-ordered folder agreement using older training examples.
     Eval {
         #[arg(long)]
         account: Option<String>,
@@ -190,7 +190,6 @@ async fn run(command: Command, config: Config) -> Result<()> {
             let n = db
                 .write(|c| {
                     let tx = c.transaction()?;
-                    // Imported history indexed only part of atrium's mail; index the rest by subject.
                     tx.execute(
                         "INSERT INTO message_fts (rowid, meta, subject, body) SELECT id, '', subject, '' FROM messages \
                          WHERE gone_at IS NULL AND id NOT IN (SELECT rowid FROM message_fts)",

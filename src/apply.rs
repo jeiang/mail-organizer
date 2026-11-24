@@ -1,6 +1,4 @@
-//! Live mode: carries out pending decisions on the server after re-checking
-//! each message (ported from atrium's `mailops.Verify` and applier), and the
-//! daily retention pass for delete rules.
+//! Guarded mailbox operations and daily retention processing.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -15,7 +13,6 @@ use crate::imap::{Imap, MailboxInfo};
 use crate::router::{self, Decision};
 use crate::rules::{self, MESSAGE_COLUMNS, Message};
 use crate::sync::is_system_name;
-use crate::utf7;
 
 const MOVE_BATCH: usize = 100;
 const MAX_FAILURES: i64 = 3;
@@ -32,6 +29,8 @@ pub enum Reason {
     Flagged,
     Unseen,
     UnsafeLabel,
+    Destination,
+    RuleChanged,
 }
 
 impl Reason {
@@ -45,6 +44,8 @@ impl Reason {
             Reason::Flagged => "flagged",
             Reason::Unseen => "unseen",
             Reason::UnsafeLabel => "unsafe_label",
+            Reason::Destination => "destination",
+            Reason::RuleChanged => "rule_changed",
         }
     }
 }
@@ -108,7 +109,7 @@ pub fn guard(preset: Preset, stored: &Stored, observed: &Observed) -> Result<(),
 
 /// A Gmail label the applier may add.
 pub fn safe_label(name: &str) -> bool {
-    !name.starts_with('\\') && !is_system_name(name) && !name.starts_with("[Gmail]")
+    rules::filing_destination(name)
 }
 
 #[derive(Debug, Clone)]
@@ -163,7 +164,7 @@ fn load_pending(c: &Connection, account: &str, cap: usize) -> Result<Vec<Pending
                 msgid: r.get(10)?,
                 gone: r.get(11)?,
                 require_inbox: !retention,
-                require_seen: retention && !key.is_some_and(|k| age_rules.contains(&k)),
+                require_seen: !retention || !key.is_some_and(|k| age_rules.contains(&k)),
             },
             imap_name: r.get(12)?,
             role: r.get(13)?,
@@ -224,6 +225,7 @@ pub async fn apply_account(
         skipped = tracing::field::Empty,
         failed = tracing::field::Empty,
     );
+    let _mutation = db.mutations.lock().await;
     let out = apply_inner(db, imap, account, cap)
         .instrument(span.clone())
         .await?;
@@ -242,7 +244,7 @@ async fn apply_inner(db: &Db, imap: &mut Imap, account: &Account, cap: usize) ->
     if mode != Mode::Live || pending.is_empty() {
         return Ok(out);
     }
-    let mut listed = imap.list().await?;
+    let listed = imap.list().await?;
     let mut groups: BTreeMap<(String, i64), Vec<Pending>> = BTreeMap::new();
     let mut early = Vec::new();
     for p in pending {
@@ -252,7 +254,50 @@ async fn apply_inner(db: &Db, imap: &mut Imap, account: &Account, cap: usize) ->
             early.push((p, Result1::Skipped(Reason::Gone)));
         } else if !listed.iter().any(|m| m.imap_name == p.imap_name) {
             early.push((p, Result1::Skipped(Reason::Missing)));
+        } else if p.action == "file"
+            && !p.dest.as_deref().is_some_and(|dest| {
+                rules::filing_destination(dest) && listed.iter().any(|m| m.name == dest)
+            })
+        {
+            early.push((p, Result1::Skipped(Reason::Destination)));
         } else {
+            let candidate = p.clone();
+            let name = account.name.clone();
+            let current = db
+                .read(move |c| {
+                    let m = c.query_row(
+                        &format!("SELECT {MESSAGE_COLUMNS} FROM messages m WHERE id = ?1"),
+                        [candidate.message_id],
+                        Message::from_row,
+                    )?;
+                    let rules = rules::load(c, Some(&name))?;
+                    let rule = rules::first_match(&m, &rules, db::now());
+                    let fresh = if candidate.stage == RETENTION {
+                        rule.is_some_and(|r| {
+                            r.action == rules::Action::Delete && (m.seen || r.has_age())
+                        })
+                    } else {
+                        let d = router::decide(c, &m, &rules, db::now(), true)?;
+                        d.action == candidate.action && d.dest == candidate.dest
+                    };
+                    let detail: String = c.query_row(
+                        "SELECT detail FROM decisions WHERE id = ?1",
+                        [candidate.decision_id],
+                        |r| r.get(0),
+                    )?;
+                    let snapshot = serde_json::from_str::<serde_json::Value>(&detail)?
+                        .get("rule")
+                        .cloned();
+                    Ok(fresh
+                        && snapshot.is_none_or(|s| {
+                            rule.is_some_and(|r| serde_json::to_value(r).ok().as_ref() == Some(&s))
+                        }))
+                })
+                .await?;
+            if !current {
+                early.push((p, Result1::Skipped(Reason::RuleChanged)));
+                continue;
+            }
             groups
                 .entry((p.imap_name.clone(), p.stored.uidvalidity))
                 .or_default()
@@ -305,7 +350,7 @@ async fn apply_inner(db: &Db, imap: &mut Imap, account: &Account, cap: usize) ->
         for ((action, dest), batch) in by_target {
             for chunk in batch.chunks(MOVE_BATCH) {
                 let uids: Vec<u32> = chunk.iter().map(|p| p.uid).collect();
-                let r = execute(imap, &mut listed, &action, dest.as_deref(), &uids).await;
+                let r = execute(imap, &listed, &action, dest.as_deref(), &uids).await;
                 let result = |r: &Result<()>| match r {
                     Ok(()) => Ok(()),
                     Err(e) if is_server_refusal(e) => Err(format!("{e:#}")),
@@ -335,7 +380,7 @@ async fn apply_inner(db: &Db, imap: &mut Imap, account: &Account, cap: usize) ->
 
 async fn execute(
     imap: &mut Imap,
-    listed: &mut Vec<MailboxInfo>,
+    listed: &[MailboxInfo],
     action: &str,
     dest: Option<&str>,
     uids: &[u32],
@@ -360,19 +405,12 @@ async fn execute(
         }
         ("file", Preset::Icloud) => {
             let dest = dest.ok_or_else(|| anyhow!("file decision without dest"))?;
-            let imap_name = match listed.iter().find(|m| m.name == dest) {
-                Some(m) => m.imap_name.clone(),
-                None => {
-                    let encoded = utf7::encode(dest);
-                    imap.create_mailbox(&encoded).await?;
-                    listed.push(MailboxInfo {
-                        name: dest.to_owned(),
-                        imap_name: encoded.clone(),
-                        flags: Vec::new(),
-                    });
-                    encoded
-                }
-            };
+            let imap_name = listed
+                .iter()
+                .find(|m| m.name == dest)
+                .ok_or_else(|| anyhow!("destination no longer exists: {dest}"))?
+                .imap_name
+                .clone();
             imap.uid_move(uids, &imap_name).await
         }
         (other, _) => Err(anyhow!("unknown action {other}")),
@@ -510,7 +548,7 @@ pub async fn deletion_pass(db: &Db, account: &Account, force: bool) -> Result<us
                 dest: None,
                 key: Some(rule.id.clone()),
                 confidence: None,
-                detail: serde_json::json!({}),
+                detail: serde_json::json!({"rule": rule}),
             };
             router::record(&tx, m, &d, now, Some("pending"))?;
             queued += 1;
@@ -697,5 +735,30 @@ mod tests {
             Some("a.b@c")
         );
         assert_eq!(server_msgid(b"Subject: x\r\n\r\n"), None);
+    }
+
+    #[test]
+    fn queued_filing_requires_read_status() {
+        let mut c = Connection::open_in_memory().unwrap();
+        db::migrate(&mut c).unwrap();
+        c.execute_batch("INSERT INTO accounts(name,preset) VALUES ('test','icloud');
+            INSERT INTO mailboxes(id,account,name,imap_name,role) VALUES (1,'test','INBOX','INBOX','inbox');
+            INSERT INTO messages(id,account,mailbox_id,uidvalidity,uid,digest,seen,in_inbox,first_seen)
+            VALUES (1,'test',1,1,1,'message',1,1,1);
+            INSERT INTO decisions(message_id,account,ts,stage,action,dest,apply_state)
+            VALUES (1,'test',1,'learned','file','News','pending');").unwrap();
+        let pending = load_pending(&c, "test", 1).unwrap().remove(0);
+        assert_eq!(
+            guard(
+                Preset::Icloud,
+                &pending.stored,
+                &Observed {
+                    uidvalidity: 1,
+                    flags: vec![],
+                    ..observed()
+                }
+            ),
+            Err(Reason::Unseen)
+        );
     }
 }

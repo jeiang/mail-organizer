@@ -1,5 +1,4 @@
-//! Operator rules and learned sender patterns, ported from atrium's
-//! `rules/rules.go`.
+//! Explicit rules and learned sender patterns.
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -8,12 +7,13 @@ use regex::Regex;
 use rusqlite::{Connection, Row, params};
 use serde::Serialize;
 use serde_json::{Map, Value, json};
+use sha2::{Digest, Sha256};
 
 pub const AGE_FIELD: &str = "age_days";
 const AGE_OP: &str = "gte";
 const SECONDS_PER_DAY: f64 = 86400.0;
-const LIST_FIELDS: [&str; 5] = ["to", "dkim_d", "esp", "att_type", "att_name"];
-const SCALAR_FIELDS: [&str; 11] = [
+pub const LIST_FIELDS: [&str; 5] = ["to", "dkim_d", "esp", "att_type", "att_name"];
+pub const SCALAR_FIELDS: [&str; 11] = [
     "from_addr",
     "from_domain",
     "from_name",
@@ -26,15 +26,47 @@ const SCALAR_FIELDS: [&str; 11] = [
     "precedence",
     "category",
 ];
-const OPS: [&str; 6] = ["eq", "in", "suffix", "re", "present", "absent"];
+pub const OPS: [&str; 6] = ["eq", "in", "suffix", "re", "present", "absent"];
+
+pub fn filing_destination(name: &str) -> bool {
+    let folded = name.to_lowercase();
+    !name.is_empty()
+        && name.trim() == name
+        && !name.chars().any(char::is_control)
+        && !name.starts_with('\\')
+        && !folded.starts_with("[gmail]")
+        && folded != "misc"
+        && !folded.starts_with("misc/")
+        && folded != "inbox"
+        && !crate::sync::is_system_name(name)
+}
+
+pub fn destinations(c: &Connection, account: &str) -> Result<Vec<String>> {
+    if let Some(value) = crate::db::get_state(c, &format!("folders:{account}"))? {
+        return Ok(serde_json::from_str::<Vec<String>>(&value)?
+            .into_iter()
+            .filter(|f| filing_destination(f))
+            .collect());
+    }
+    Ok(
+        c.prepare(
+            "SELECT name FROM mailboxes WHERE account = ?1 AND role = 'filed' ORDER BY name",
+        )?
+        .query_map([account], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|f| filing_destination(f))
+        .collect(),
+    )
+}
 
 pub const MIN_N: usize = 3;
 pub const MIN_PURITY: f64 = 0.9;
 
 /// Learned levels, most specific first: (name, columns).
 pub const LEARNED_LEVELS: [(&str, &[&str]); 3] = [
-    ("addr", &["from_addr"]),
     ("addr+tmpl", &["from_addr", "subject_tmpl"]),
+    ("addr", &["from_addr"]),
     ("domain", &["from_domain"]),
 ];
 
@@ -207,6 +239,11 @@ pub fn validate_rule(raw: &Value) -> Result<Rule, RuleError> {
         (Action::Delete, Some(_)) => return rule_err(format!("{id}: delete rule takes no dest")),
         (Action::Delete, None) => None,
     };
+    if dest.as_deref().is_some_and(|d| !filing_destination(d)) {
+        return rule_err(format!(
+            "{id}: destination must be an ordinary folder outside Misc"
+        ));
+    }
     let account = match obj.get("account").filter(|v| !v.is_null()) {
         None => None,
         Some(Value::String(a)) => Some(a.clone()),
@@ -389,19 +426,74 @@ pub fn load(c: &Connection, account: Option<&str>) -> Result<Vec<Rule>> {
 pub fn import(c: &mut Connection, document: &Value) -> Result<usize> {
     let rules = parse_ruleset(document)?;
     let tx = c.transaction()?;
-    tx.execute("DELETE FROM rules", [])?;
-    for (i, r) in rules.iter().enumerate() {
-        tx.execute(
-            "INSERT INTO rules (position, id, account, action, dest, conditions) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![i as i64, r.id, r.account, r.action.as_str(), r.dest, serde_json::to_string(&r.conditions)?],
-        )?;
-    }
+    store(&tx, &rules)?;
     tx.commit()?;
     Ok(rules.len())
 }
 
+fn store(c: &Connection, rules: &[Rule]) -> Result<()> {
+    c.execute(
+        "UPDATE decisions SET apply_state = 'skipped', apply_error = 'rule_changed'
+        WHERE apply_state = 'pending'",
+        [],
+    )?;
+    c.execute("DELETE FROM state WHERE key LIKE 'deletion:%'", [])?;
+    c.execute("DELETE FROM rules", [])?;
+    for (i, r) in rules.iter().enumerate() {
+        c.execute(
+            "INSERT INTO rules (position, id, account, action, dest, conditions) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![i as i64, r.id, r.account, r.action.as_str(), r.dest, serde_json::to_string(&r.conditions)?],
+        )?;
+    }
+    Ok(())
+}
+
 pub fn export(c: &Connection) -> Result<Value> {
     Ok(json!({ "rules": load(c, None)? }))
+}
+
+pub fn revision(c: &Connection) -> Result<String> {
+    Ok(hex::encode(Sha256::digest(export(c)?.to_string())))
+}
+
+pub fn save(
+    c: &mut Connection,
+    rule: Rule,
+    original: &str,
+    position: usize,
+    expected: &str,
+) -> Result<()> {
+    let tx = c.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    if revision(&tx)? != expected {
+        return Err(RuleError(
+            "Rules changed while you were editing. Reload and preview again.".into(),
+        )
+        .into());
+    }
+    let mut all = load(&tx, None)?;
+    let stored: usize = tx.query_row("SELECT COUNT(*) FROM rules", [], |r| r.get(0))?;
+    anyhow::ensure!(
+        stored == all.len(),
+        "Invalid stored rules must be repaired with CLI import before editing."
+    );
+    if original.is_empty() {
+        if all.iter().any(|r| r.id == rule.id) {
+            return Err(RuleError("A rule with that id already exists.".into()).into());
+        }
+    } else {
+        if rule.id != original {
+            return Err(RuleError("An existing rule's id cannot be changed.".into()).into());
+        }
+        let index = all
+            .iter()
+            .position(|r| r.id == original)
+            .ok_or_else(|| RuleError("This rule no longer exists.".into()))?;
+        all.remove(index);
+    }
+    all.insert(position.min(all.len()), rule);
+    store(&tx, &all)?;
+    tx.commit()?;
+    Ok(())
 }
 
 pub struct Picked {
@@ -431,6 +523,7 @@ pub fn pick_pure(counts: &BTreeMap<String, usize>) -> Option<Picked> {
 pub struct Learned {
     pub level: &'static str,
     pub key: String,
+    pub values: Vec<String>,
     pub dest: String,
     pub purity: f64,
     pub n: usize,
@@ -446,7 +539,7 @@ pub fn learned_counts(
 ) -> Result<BTreeMap<String, usize>> {
     let filter: Vec<String> = columns.iter().map(|col| format!("{col} = ?")).collect();
     let sql = format!(
-        "SELECT folder, COUNT(*) FROM filed_messages WHERE account = ? AND {} AND id != ? GROUP BY folder",
+        "SELECT folder, COUNT(*) FROM training_messages WHERE account = ? AND {} AND id != ? GROUP BY folder",
         filter.join(" AND ")
     );
     let mut args: Vec<&dyn rusqlite::ToSql> = vec![&account];
@@ -478,6 +571,7 @@ pub fn learned_match(c: &Connection, m: &Message) -> Result<Option<Learned>> {
             return Ok(Some(Learned {
                 level,
                 key: values.join(" | "),
+                values: values.iter().map(|v| (*v).to_owned()).collect(),
                 dest: p.folder,
                 purity: p.purity,
                 n: p.total,
@@ -495,10 +589,10 @@ pub fn learned_patterns(c: &Connection, account: &str) -> Result<Vec<Learned>> {
         let cols = columns.join(", ");
         let nonblank: Vec<String> = columns.iter().map(|col| format!("{col} != ''")).collect();
         let sql = format!(
-            "SELECT {cols}, folder, COUNT(*) FROM filed_messages WHERE account = ?1 AND {} GROUP BY {cols}, folder",
+            "SELECT {cols}, folder, COUNT(*) FROM training_messages WHERE account = ?1 AND {} GROUP BY {cols}, folder",
             nonblank.join(" AND ")
         );
-        let mut groups: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
+        let mut groups: BTreeMap<Vec<String>, BTreeMap<String, usize>> = BTreeMap::new();
         let mut stmt = c.prepare(&sql)?;
         let mut rows = stmt.query([account])?;
         while let Some(r) = rows.next()? {
@@ -507,16 +601,14 @@ pub fn learned_patterns(c: &Connection, account: &str) -> Result<Vec<Learned>> {
                 .collect::<rusqlite::Result<_>>()?;
             let folder: String = r.get(columns.len())?;
             let n: i64 = r.get(columns.len() + 1)?;
-            groups
-                .entry(key.join(" | "))
-                .or_default()
-                .insert(folder, n as usize);
+            groups.entry(key).or_default().insert(folder, n as usize);
         }
         for (key, counts) in groups {
             if let Some(p) = pick_pure(&counts) {
                 out.push(Learned {
                     level,
-                    key,
+                    key: key.join(" | "),
+                    values: key,
                     dest: p.folder,
                     purity: p.purity,
                     n: p.total,
@@ -604,6 +696,18 @@ mod tests {
     }
 
     #[test]
+    fn stale_edits_cannot_replace_newer_rules() {
+        let mut c = Connection::open_in_memory().unwrap();
+        crate::db::migrate(&mut c).unwrap();
+        let initial = revision(&c).unwrap();
+        let first = validate_rule(&json!({"id":"first","dest":"News","when":[{"field":"from_addr","op":"eq","value":"news@example.com"}]})).unwrap();
+        save(&mut c, first.clone(), "", 0, &initial).unwrap();
+        let saved = export(&c).unwrap();
+        assert!(save(&mut c, first, "first", 0, &initial).is_err());
+        assert_eq!(export(&c).unwrap(), saved);
+    }
+
+    #[test]
     fn rejections() {
         let when = json!([{"field":"subject","op":"eq","value":"x"}]);
         assert!(
@@ -629,6 +733,9 @@ mod tests {
             .is_err()
         );
         assert!(parse_ruleset(&json!([{"id":"a","action":"delete","when":when}])).is_ok());
+        for dest in ["Misc", "misc/News", "INBOX", "Trash", "News\nInjected"] {
+            assert!(validate_rule(&json!({"id":"a","dest":dest,"when":when})).is_err());
+        }
     }
 
     #[test]
