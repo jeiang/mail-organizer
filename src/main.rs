@@ -190,6 +190,12 @@ async fn run(command: Command, config: Config) -> Result<()> {
             let n = db
                 .write(|c| {
                     let tx = c.transaction()?;
+                    // Imported history indexed only part of atrium's mail; index the rest by subject.
+                    tx.execute(
+                        "INSERT INTO message_fts (rowid, meta, subject, body) SELECT id, '', subject, '' FROM messages \
+                         WHERE gone_at IS NULL AND id NOT IN (SELECT rowid FROM message_fts)",
+                        [],
+                    )?;
                     let ids: Vec<i64> = tx
                         .prepare("SELECT rowid FROM message_fts")?
                         .query_map([], |r| r.get(0))?
