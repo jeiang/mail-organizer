@@ -6,6 +6,7 @@ mod db;
 mod features;
 mod imap;
 mod metrics;
+mod router;
 mod rules;
 mod similar;
 mod sync;
@@ -173,6 +174,15 @@ async fn run(command: Command, config: Config) -> Result<()> {
             let doc: serde_json::Value = serde_json::from_str(&text)?;
             let n = db.write(move |c| rules::import(c, &doc)).await?;
             println!("imported {n} rule(s)");
+        }
+        Command::Route { account } => {
+            for account in config.select(account.as_deref())? {
+                let routed = router::route_account(&db, &account.name).await?;
+                println!(
+                    "{}: {} eligible, {:?}",
+                    account.name, routed.eligible, routed.by_stage
+                );
+            }
         }
         _ => anyhow::bail!("not implemented yet"),
     }
