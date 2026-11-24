@@ -1,6 +1,7 @@
 // Removed once every module is wired into a command.
 #![allow(dead_code)]
 
+mod apply;
 mod config;
 mod db;
 mod features;
