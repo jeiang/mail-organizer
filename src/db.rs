@@ -34,6 +34,8 @@ impl Db {
         let conn = Connection::open(path).with_context(|| format!("opening {}", path.display()))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         configure(&conn)?;
+        // Include all tables because query reads use separate read-only connections.
+        conn.execute_batch("PRAGMA optimize = 0x10002")?;
         Ok(Self {
             path: path.to_owned(),
             writer: Arc::new(Mutex::new(conn)),
