@@ -17,8 +17,8 @@ use crate::sync::{self, INBOX};
 
 const TIMER: Duration = Duration::from_secs(15 * 60);
 const SETTLE: Duration = Duration::from_secs(2);
-/// Servers drop long IDLEs, and iCloud does not report flag changes made by
-/// other clients, so IDLE in slices and check for newly readable mail between them.
+/// Servers drop long IDLEs silently, and changes during a pass are not seen by
+/// IDLE, so IDLE in slices and check for newly readable mail between them.
 const SLICE: Duration = Duration::from_secs(2 * 60);
 const READABLE: &str = "SEEN UNFLAGGED UNDELETED";
 const BACKOFF_START: Duration = Duration::from_secs(5);
@@ -98,9 +98,11 @@ async fn session(
     let mut imap = Imap::connect(account).await?;
     let mut trigger = "start";
     loop {
-        pass(db, &mut imap, account, cap, trigger).await?;
+        // Baseline before the pass, so mail read while it runs triggers the next one.
         imap.select(INBOX).await?;
         let mut readable = imap.uid_search(READABLE).await?;
+        pass(db, &mut imap, account, cap, trigger).await?;
+        imap.select(INBOX).await?;
         let deadline = Instant::now() + TIMER;
         trigger = loop {
             let (next, changed) = tokio::select! {
