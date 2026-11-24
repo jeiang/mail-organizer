@@ -135,13 +135,29 @@ fn label_arg(label: &str) -> String {
     }
 }
 
+/// Undoes IMAP quoted-string escapes, which imap-proto leaves in labels.
+fn unquote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        match (c, chars.clone().next()) {
+            ('\\', Some(n @ ('\\' | '"'))) => {
+                out.push(n);
+                chars.next();
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 fn convert(f: &Fetch, gmail: bool) -> Option<Fetched> {
     Some(Fetched {
         uid: f.uid?,
         flags: f.flags().filter_map(|x| flag_str(&x)).collect(),
         labels: gmail.then(|| {
             f.gmail_labels()
-                .map(|l| l.iter().map(|x| utf7::decode(x)).collect())
+                .map(|l| l.iter().map(|x| utf7::decode(&unquote(x))).collect())
                 .unwrap_or_default()
         }),
         header: f.header().map(<[u8]>::to_vec).unwrap_or_default(),
@@ -409,6 +425,13 @@ mod tests {
     fn uid_sets() {
         assert_eq!(uid_set(&[7, 1, 2, 3, 9, 10]), "1:3,7,9:10");
         assert_eq!(uid_set(&[5]), "5");
+    }
+
+    #[test]
+    fn unquoting() {
+        assert_eq!(unquote("\\\\Important"), "\\Important");
+        assert_eq!(unquote("\\Inbox"), "\\Inbox");
+        assert_eq!(unquote("a \\\"b\\\""), "a \"b\"");
     }
 
     #[test]
