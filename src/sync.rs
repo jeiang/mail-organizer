@@ -251,6 +251,7 @@ async fn sync_inner(db: &Db, imap: &mut Imap, account: &Account) -> Result<Stats
         .write(move |c| {
             reconcile(c, &name, &gone, run)?;
             c.execute("UPDATE accounts SET last_sync_at = ?1 WHERE name = ?2", params![run, name])?;
+            c.execute_batch("PRAGMA optimize")?;
             Ok(c.query_row(
                 "SELECT COUNT(*) FROM messages WHERE account = ?1 AND in_inbox = 1 AND gone_at IS NULL AND sent = 0",
                 [&name],
