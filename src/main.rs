@@ -4,7 +4,10 @@
 mod config;
 mod db;
 mod features;
+mod imap;
 mod metrics;
+mod rules;
+mod similar;
 mod sync;
 mod telemetry;
 mod utf7;
@@ -113,6 +116,9 @@ async fn main() -> ExitCode {
 
 async fn run(command: Command, config: Config) -> Result<()> {
     let db = Db::open(&config.db)?;
+    if !matches!(command, Command::Migrate) {
+        db.write(db::migrate).await?;
+    }
     match command {
         Command::Migrate => {
             let n = db.write(db::migrate).await?;
@@ -134,6 +140,21 @@ async fn run(command: Command, config: Config) -> Result<()> {
                 })
                 .await?;
             println!("{}", current.as_str());
+        }
+        Command::Sync { account } => {
+            for account in config.select(account.as_deref())? {
+                let mut imap = imap::Imap::connect(&account).await?;
+                let stats = sync::sync_account(&db, &mut imap, &account).await?;
+                imap.logout().await;
+                println!(
+                    "{}: {} new, {} gone, {} flag changes, {} mailboxes",
+                    account.name,
+                    stats.new,
+                    stats.gone.len(),
+                    stats.flag_changes,
+                    stats.mailboxes
+                );
+            }
         }
         _ => anyhow::bail!("not implemented yet"),
     }

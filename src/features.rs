@@ -149,7 +149,7 @@ fn unescape(text: &str) -> String {
     while let Some(i) = rest.find('&') {
         out.push_str(&rest[..i]);
         rest = &rest[i..];
-        let end = rest[..rest.len().min(12)].find(';');
+        let end = rest.bytes().take(12).position(|b| b == b';');
         let decoded = end.and_then(|e| {
             let name = &rest[1..e];
             let ch = match name {
@@ -392,5 +392,9 @@ Content-Type: text/plain\r\n\r\n";
             0.0,
         );
         assert_eq!(f.body, "Hello\u{a0} you & me");
+        assert_eq!(
+            unescape("&ab\u{feff}\u{feff}\u{feff}x"),
+            "&ab\u{feff}\u{feff}\u{feff}x"
+        );
     }
 }
