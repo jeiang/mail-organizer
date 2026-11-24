@@ -1,7 +1,16 @@
+// Removed once every module is wired into a command.
+#![allow(dead_code)]
+
+mod config;
+mod db;
+
 use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+
+use crate::config::Config;
+use crate::db::Db;
 
 #[derive(Parser)]
 #[command(
@@ -61,8 +70,34 @@ enum RulesCommand {
     },
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let cli = Cli::parse();
-    let _ = (cli.config, cli.command);
-    anyhow::bail!("not implemented yet")
+    let config = Config::load(&cli.config)?;
+    let db = Db::open(&config.db)?;
+    match cli.command {
+        Command::Migrate => {
+            let n = db.write(db::migrate).await?;
+            println!("applied {n} migration(s)");
+        }
+        Command::Mode { mode } => {
+            let mode = match mode.as_deref() {
+                None => None,
+                Some("shadow") => Some(db::Mode::Shadow),
+                Some("live") => Some(db::Mode::Live),
+                Some(other) => anyhow::bail!("unknown mode {other:?}, want shadow or live"),
+            };
+            let current = db
+                .write(move |c| {
+                    if let Some(m) = mode {
+                        db::set_mode(c, m)?;
+                    }
+                    db::mode(c)
+                })
+                .await?;
+            println!("{}", current.as_str());
+        }
+        _ => anyhow::bail!("not implemented yet"),
+    }
+    Ok(())
 }
