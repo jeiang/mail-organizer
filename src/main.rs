@@ -3,8 +3,11 @@
 
 mod config;
 mod db;
+mod features;
 mod metrics;
+mod sync;
 mod telemetry;
+mod utf7;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
