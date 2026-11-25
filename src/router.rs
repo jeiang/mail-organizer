@@ -55,6 +55,7 @@ pub fn decide(
             detail: json!({"n": l.n, "pattern": l.key, "counts": l.counts}),
         });
     }
+    let mut detail = json!({});
     if let Some(model) = model {
         let (dest, p, top) = model.predict(m, &classify::body(c, m.id)?);
         if p >= MODEL_MIN {
@@ -67,12 +68,15 @@ pub fn decide(
                 detail: json!({"p": p, "top": top}),
             });
         }
+        // Keep the near miss visible on the inbox page.
+        detail = json!({"model": {"p": p, "top": top}});
     }
-    let mut detail = json!({});
     if use_similar {
         let near = similar::neighbours(c, m, SIMILAR_K)?;
         if let Some((folder, share)) = similar::vote(&near) {
-            detail = json!({"neighbours": near, "share": share, "vote": folder});
+            detail["neighbours"] = json!(near);
+            detail["share"] = json!(share);
+            detail["vote"] = json!(folder);
             if near.len() >= SIMILAR_MIN_HITS && share >= SIMILAR_MIN_SHARE {
                 return Ok(Decision {
                     stage: "similar",
