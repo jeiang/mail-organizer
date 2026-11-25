@@ -126,7 +126,7 @@ async fn form_content(app: &App, form: &BTreeMap<String, String>, error: Option<
         .map_or(1, |i| i + 2);
     let original = value(form, "original");
     let body = html! {
-        p { "Rules are optional overrides. All conditions must match; the first matching rule wins. Misc is manual-only and cannot have subfolders." }
+        p { "Rules are optional overrides. All conditions must match; the first matching rule wins. Misc is for leftovers and is excluded from learning." }
         @if let Some(error) = error { p class="error" role="alert" { (error) } }
         form method="post" action="/rules/preview" {
             input type="hidden" name="csrf" value=(app.csrf.as_ref());

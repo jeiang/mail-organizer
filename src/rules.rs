@@ -35,7 +35,6 @@ pub fn filing_destination(name: &str) -> bool {
         && !name.chars().any(char::is_control)
         && !name.starts_with('\\')
         && !folded.starts_with("[gmail]")
-        && folded != "misc"
         && !folded.starts_with("misc/")
         && folded != "inbox"
         && !crate::sync::is_system_name(name)
@@ -48,24 +47,23 @@ pub fn destinations(c: &Connection, account: &str) -> Result<Vec<String>> {
             .filter(|f| filing_destination(f))
             .collect());
     }
-    Ok(
-        c.prepare(
-            "SELECT name FROM mailboxes WHERE account = ?1 AND role = 'filed' ORDER BY name",
-        )?
-        .query_map([account], |r| r.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?
-        .into_iter()
-        .filter(|f| filing_destination(f))
-        .collect(),
-    )
+    Ok(c.prepare(
+        "SELECT name FROM mailboxes WHERE account = ?1 AND role IN ('filed', 'misc') ORDER BY name",
+    )?
+    .query_map([account], |r| r.get::<_, String>(0))?
+    .collect::<rusqlite::Result<Vec<_>>>()?
+    .into_iter()
+    .filter(|f| filing_destination(f))
+    .collect())
 }
 
 pub const MIN_N: usize = 3;
 pub const MIN_PURITY: f64 = 0.9;
 
 /// Learned levels, most specific first: (name, columns).
-pub const LEARNED_LEVELS: [(&str, &[&str]); 3] = [
+pub const LEARNED_LEVELS: [(&str, &[&str]); 4] = [
     ("addr+tmpl", &["from_addr", "subject_tmpl"]),
+    ("list", &["list_id"]),
     ("addr", &["from_addr"]),
     ("domain", &["from_domain"]),
 ];
@@ -241,7 +239,7 @@ pub fn validate_rule(raw: &Value) -> Result<Rule, RuleError> {
     };
     if dest.as_deref().is_some_and(|d| !filing_destination(d)) {
         return rule_err(format!(
-            "{id}: destination must be an ordinary folder outside Misc"
+            "{id}: destination must be a folder the sorter can file into"
         ));
     }
     let account = match obj.get("account").filter(|v| !v.is_null()) {
@@ -733,9 +731,10 @@ mod tests {
             .is_err()
         );
         assert!(parse_ruleset(&json!([{"id":"a","action":"delete","when":when}])).is_ok());
-        for dest in ["Misc", "misc/News", "INBOX", "Trash", "News\nInjected"] {
+        for dest in ["misc/News", "INBOX", "Trash", "News\nInjected"] {
             assert!(validate_rule(&json!({"id":"a","dest":dest,"when":when})).is_err());
         }
+        assert!(validate_rule(&json!({"id":"a","dest":"Misc","when":when})).is_ok());
     }
 
     #[test]

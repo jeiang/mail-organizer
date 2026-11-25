@@ -1,6 +1,7 @@
 //! FTS5 BM25 retrieval over metadata, subject, and body.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension, params};
@@ -12,6 +13,63 @@ use crate::rules::Message;
 const MAX_TERMS: usize = 64;
 const SUBJECT_WORDS: usize = 16;
 const BODY_WORDS: usize = 32;
+
+/// A term in more than 1% of the account's filed mail, or in 50 messages,
+/// cannot discriminate between folders.
+const COMMON_SHARE: i64 = 100;
+const COMMON_FLOOR: i64 = 50;
+type Common = HashMap<String, (i64, Arc<HashSet<String>>)>;
+static COMMON: LazyLock<Mutex<Common>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// The account's terms that are too common to search on, cached until the
+/// known training set changes.
+fn common_terms(c: &Connection, account: &str) -> Result<Arc<HashSet<String>>> {
+    let n: i64 = c.query_row(
+        "SELECT COUNT(*) FROM main.training_messages WHERE account = ?1",
+        [account],
+        |r| r.get(0),
+    )?;
+    if let Ok(cached) = COMMON.lock()
+        && let Some((seen, terms)) = cached.get(account)
+        && *seen == n
+    {
+        return Ok(terms.clone());
+    }
+    let threshold = COMMON_FLOOR.max((n + COMMON_SHARE - 1) / COMMON_SHARE);
+    let mut counts: HashMap<String, i64> = HashMap::new();
+    let mut stmt = c.prepare(
+        "SELECT f.subject, f.body FROM message_fts f \
+         JOIN main.training_messages t ON t.id = f.rowid WHERE t.account = ?1",
+    )?;
+    let mut rows = stmt.query([account])?;
+    while let Some(row) = rows.next()? {
+        let subject: String = row.get(0)?;
+        let body: String = row.get(1)?;
+        let mut seen = HashSet::new();
+        for text in [&subject, &body] {
+            for w in text.split(|c: char| !c.is_alphanumeric()) {
+                let w = w.to_lowercase();
+                if w.chars().count() >= 3 {
+                    seen.insert(w);
+                }
+            }
+        }
+        for w in seen {
+            *counts.entry(w).or_default() += 1;
+        }
+    }
+    let common: Arc<HashSet<String>> = Arc::new(
+        counts
+            .into_iter()
+            .filter(|(_, n)| *n >= threshold)
+            .map(|(w, _)| w)
+            .collect(),
+    );
+    if let Ok(mut cache) = COMMON.lock() {
+        cache.insert(account.to_owned(), (n, common.clone()));
+    }
+    Ok(common)
+}
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Neighbour {
@@ -35,8 +93,8 @@ fn words(text: &str, min_len: usize, limit: usize, seen: &mut HashSet<String>) -
 }
 
 /// The FTS5 query for a message: its metadata tokens, then subject and body
-/// words, ORed.
-pub fn query(meta: &str, subject: &str, body: &str) -> Option<String> {
+/// words, ORed, with common words dropped.
+fn query_with(meta: &str, subject: &str, body: &str, common: &HashSet<String>) -> Option<String> {
     let mut seen = HashSet::new();
     let mut terms: Vec<String> = meta
         .split_whitespace()
@@ -45,6 +103,7 @@ pub fn query(meta: &str, subject: &str, body: &str) -> Option<String> {
         .collect();
     terms.extend(words(subject, 3, SUBJECT_WORDS, &mut seen));
     terms.extend(words(body, 4, BODY_WORDS, &mut seen));
+    terms.retain(|t| !common.contains(t));
     terms.truncate(MAX_TERMS);
     let quoted: Vec<String> = terms
         .iter()
@@ -66,7 +125,8 @@ pub fn neighbours(c: &Connection, m: &Message, k: usize) -> Result<Vec<Neighbour
         )
         .optional()?
         .unwrap_or_default();
-    let Some(q) = query(&meta_tokens(m), &m.subject, &body) else {
+    let common = common_terms(c, &m.account)?;
+    let Some(q) = query_with(&meta_tokens(m), &m.subject, &body, &common) else {
         return Ok(Vec::new());
     };
     let mut stmt = c.prepare_cached(
@@ -167,15 +227,35 @@ mod tests {
 
     #[test]
     fn queries() {
-        let q = query(
+        let q = query_with(
             "fa_x_y_com st_hello",
             "Hello \"there\" world",
             "body text here",
+            &HashSet::new(),
         )
         .unwrap();
         assert_eq!(
             q,
             r#""fa_x_y_com" OR "st_hello" OR "hello" OR "there" OR "world" OR "body" OR "text" OR "here""#
+        );
+    }
+
+    #[test]
+    fn drops_common_words_but_keeps_metadata() {
+        let common: HashSet<String> = ["welcome", "following"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        let q = query_with(
+            "fa_replit_com li_account_updates_service_tiktok_com",
+            "Welcome to Vibe",
+            "Scott started following you",
+            &common,
+        )
+        .unwrap();
+        assert_eq!(
+            q,
+            r#""fa_replit_com" OR "li_account_updates_service_tiktok_com" OR "vibe" OR "scott" OR "started""#
         );
     }
 }
