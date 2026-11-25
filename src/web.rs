@@ -146,6 +146,23 @@ fn when(ts: &str) -> String {
     )
 }
 
+/// The classifier's top folders and their probabilities, best first.
+fn candidates(model: &Value) -> String {
+    model
+        .get("top")
+        .and_then(Value::as_array)
+        .map(|top| {
+            top.iter()
+                .filter_map(|entry| {
+                    let folder = entry.get(0)?.as_str()?;
+                    let p = entry.get(1)?.as_f64()?;
+                    Some(format!("{folder} {p:.2}"))
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+        .unwrap_or_default()
+}
 fn agreement_badge(agreement: &str, actual: &str) -> Markup {
     let label = match agreement {
         "agree" => "same folder".to_owned(),
@@ -820,7 +837,10 @@ async fn inbox(State(app): State<App>) -> Page {
                         @else if m[9] == "failed" { "Server refused the action: " (m[10]) }
                         @else if m[9] == "done" || m[9] == "imported" { "Previously decided; not automatically replayed" }
                         @else if !m[10].is_empty() { "Waiting after safety check: " (m[10]) }
-                        @else if m[8] == "none" { (detail.get("reason").and_then(Value::as_str).unwrap_or("No confident match; reconsidered after each sync")) }
+                        @else if m[8] == "none" {
+                            (detail.get("reason").and_then(Value::as_str).unwrap_or("No confident match; reconsidered after each sync"))
+                            @if let Some(model) = detail.get("model") { br; "Classifier: " (candidates(model)) }
+                        }
                         @else if m[7].is_empty() { "Awaiting evaluation" }
                         @else { "Preview decision; no action queued" }
                     }
