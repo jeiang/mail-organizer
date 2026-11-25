@@ -1,11 +1,13 @@
-//! Routing: operator rules, then learned sender patterns, then the BM25
-//! neighbour vote. Anything else stays in the inbox for the owner to move.
+//! Routing: operator rules, then learned sender patterns, then the per-account
+//! classifier, then the BM25 neighbour vote. Anything else stays in the inbox
+//! for the owner to move.
 
 use anyhow::Result;
 use rusqlite::{Connection, params};
 use serde_json::{Value, json};
 use tracing::{Span, info, info_span};
 
+use crate::classify;
 use crate::db::{self, Db, Mode};
 use crate::rules::{self, MESSAGE_COLUMNS, Message, Rule};
 use crate::similar;
@@ -13,6 +15,7 @@ use crate::similar;
 pub const SIMILAR_K: usize = 7;
 pub const SIMILAR_MIN_HITS: usize = 3;
 pub const SIMILAR_MIN_SHARE: f64 = 0.9;
+pub const MODEL_MIN: f64 = 0.95;
 
 #[derive(Debug, Clone)]
 pub struct Decision {
@@ -30,6 +33,7 @@ pub fn decide(
     rules: &[Rule],
     now: f64,
     use_similar: bool,
+    model: Option<&classify::Model>,
 ) -> Result<Decision> {
     if let Some(rule) = rules::first_match(m, rules, now) {
         return Ok(Decision {
@@ -50,6 +54,19 @@ pub fn decide(
             confidence: Some(l.purity),
             detail: json!({"n": l.n, "pattern": l.key, "counts": l.counts}),
         });
+    }
+    if let Some(model) = model {
+        let (dest, p, top) = model.predict(m, &classify::body(c, m.id)?);
+        if p >= MODEL_MIN {
+            return Ok(Decision {
+                stage: "model",
+                action: "file",
+                dest: Some(dest),
+                key: Some("logreg".into()),
+                confidence: Some(p),
+                detail: json!({"p": p, "top": top}),
+            });
+        }
     }
     let mut detail = json!({});
     if use_similar {
@@ -147,6 +164,7 @@ pub async fn route_account(db: &Db, account: &str) -> Result<Routed> {
             let rules = rules::load(c, Some(&account))?;
             let destinations = rules::destinations(c, &account)?;
             let now = db::now();
+            let model = classify::Model::train(c, &account, None)?;
             let tx = c.transaction()?;
             let mut routed = Routed {
                 eligible: pending.len(),
@@ -164,7 +182,7 @@ pub async fn route_account(db: &Db, account: &str) -> Result<Routed> {
                     mail.confidence = tracing::field::Empty,
                 );
                 let _e = span.enter();
-                let mut d = decide(&tx, m, &rules, now, true)?;
+                let mut d = decide(&tx, m, &rules, now, true, model.as_ref())?;
                 if d.action == "file" && !d.dest.as_ref().is_some_and(|dest| destinations.contains(dest)) {
                     d.detail = json!({"reason": "Destination is unavailable", "proposed": d.dest, "evidence": d.detail});
                     d.stage = "none";
@@ -240,13 +258,13 @@ mod tests {
     fn unmatched_mail_is_reconsidered_after_new_examples() {
         let c = fixture();
         let m = eligible(&c, "test").unwrap().remove(0);
-        let d = decide(&c, &m, &[], 1.0, false).unwrap();
+        let d = decide(&c, &m, &[], 1.0, false, None).unwrap();
         record(&c, &m, &d, 1.0, None).unwrap();
         examples(&c, "News", 2);
         let pending = eligible(&c, "test").unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(
-            decide(&c, &pending[0], &[], 2.0, false)
+            decide(&c, &pending[0], &[], 2.0, false, None)
                 .unwrap()
                 .dest
                 .as_deref(),

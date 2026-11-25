@@ -1,4 +1,5 @@
 mod apply;
+mod classify;
 mod config;
 mod db;
 mod eval;

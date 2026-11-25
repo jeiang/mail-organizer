@@ -6,6 +6,7 @@ use anyhow::{Result, anyhow};
 use rusqlite::{Connection, params};
 use tracing::{Instrument, info, info_span, warn};
 
+use crate::classify;
 use crate::config::{Account, Preset};
 use crate::db::{self, Db, Mode};
 use crate::features;
@@ -244,6 +245,12 @@ async fn apply_inner(db: &Db, imap: &mut Imap, account: &Account, cap: usize) ->
     if mode != Mode::Live || pending.is_empty() {
         return Ok(out);
     }
+    let model = db
+        .read({
+            let name = account.name.clone();
+            move |c| Ok(classify::Model::train(c, &name, None)?.map(std::sync::Arc::new))
+        })
+        .await?;
     let listed = imap.list().await?;
     let mut groups: BTreeMap<(String, i64), Vec<Pending>> = BTreeMap::new();
     let mut early = Vec::new();
@@ -263,6 +270,7 @@ async fn apply_inner(db: &Db, imap: &mut Imap, account: &Account, cap: usize) ->
         } else {
             let candidate = p.clone();
             let name = account.name.clone();
+            let model = model.clone();
             let current = db
                 .read(move |c| {
                     let m = c.query_row(
@@ -277,7 +285,7 @@ async fn apply_inner(db: &Db, imap: &mut Imap, account: &Account, cap: usize) ->
                             r.action == rules::Action::Delete && (m.seen || r.has_age())
                         })
                     } else {
-                        let d = router::decide(c, &m, &rules, db::now(), true)?;
+                        let d = router::decide(c, &m, &rules, db::now(), true, model.as_deref())?;
                         d.action == candidate.action && d.dest == candidate.dest
                     };
                     let detail: String = c.query_row(
