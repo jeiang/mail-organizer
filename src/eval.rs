@@ -44,14 +44,22 @@ pub fn evaluate(c: &Connection, account: &str, limit: usize, use_similar: bool) 
         total: messages.len(),
         ..Report::default()
     };
+    // The classifier cannot retrain per message, so it retrains once per block
+    // of the window on everything older than that block.
+    const BLOCK: usize = 200;
     let result = (|| {
-        for m in &messages {
+        let mut model = None;
+        for (i, m) in messages.iter().enumerate() {
+            if i % BLOCK == 0 {
+                let cutoff = messages[(i + BLOCK).min(messages.len()) - 1].date_ts;
+                model = crate::classify::Model::train(c, account, Some(cutoff))?;
+            }
             c.execute_batch(&format!(
                 "DROP VIEW IF EXISTS temp.training_messages;
                  CREATE TEMP VIEW training_messages AS SELECT * FROM main.training_messages WHERE date_ts < {};",
                 m.date_ts
             ))?;
-            let d = router::decide(c, m, &rules, crate::db::now(), use_similar)?;
+            let d = router::decide(c, m, &rules, crate::db::now(), use_similar, model.as_ref())?;
             let correct = d.dest.is_some() && d.dest == m.folder;
             let tally = report.by_stage.entry(d.stage).or_default();
             tally.count += 1;
