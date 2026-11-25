@@ -14,9 +14,12 @@ const MAX_TERMS: usize = 64;
 const SUBJECT_WORDS: usize = 16;
 const BODY_WORDS: usize = 32;
 
-/// A term in more than 1% of the account's filed mail, or in 50 messages,
-/// cannot discriminate between folders.
+/// A term cannot discriminate between folders if it appears in more than 1%
+/// of the account's filed mail (at least 50 messages) and fewer than half of
+/// those messages share one folder. A frequent bank name stays; "action
+/// required" goes.
 const COMMON_SHARE: i64 = 100;
+const COMMON_CONCENTRATION: f64 = 0.5;
 const COMMON_FLOOR: i64 = 50;
 type Common = HashMap<String, (i64, Arc<HashSet<String>>)>;
 static COMMON: LazyLock<Mutex<Common>> = LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -36,15 +39,16 @@ fn common_terms(c: &Connection, account: &str) -> Result<Arc<HashSet<String>>> {
         return Ok(terms.clone());
     }
     let threshold = COMMON_FLOOR.max((n + COMMON_SHARE - 1) / COMMON_SHARE);
-    let mut counts: HashMap<String, i64> = HashMap::new();
+    let mut counts: HashMap<String, (i64, HashMap<String, i64>)> = HashMap::new();
     let mut stmt = c.prepare(
-        "SELECT f.subject, f.body FROM message_fts f \
+        "SELECT f.subject, f.body, t.folder FROM message_fts f \
          JOIN main.training_messages t ON t.id = f.rowid WHERE t.account = ?1",
     )?;
     let mut rows = stmt.query([account])?;
     while let Some(row) = rows.next()? {
         let subject: String = row.get(0)?;
         let body: String = row.get(1)?;
+        let folder: String = row.get::<_, Option<String>>(2)?.unwrap_or_default();
         let mut seen = HashSet::new();
         for text in [&subject, &body] {
             for w in text.split(|c: char| !c.is_alphanumeric()) {
@@ -55,13 +59,18 @@ fn common_terms(c: &Connection, account: &str) -> Result<Arc<HashSet<String>>> {
             }
         }
         for w in seen {
-            *counts.entry(w).or_default() += 1;
+            let (df, by_folder) = counts.entry(w).or_default();
+            *df += 1;
+            *by_folder.entry(folder.clone()).or_default() += 1;
         }
     }
     let common: Arc<HashSet<String>> = Arc::new(
         counts
             .into_iter()
-            .filter(|(_, n)| *n >= threshold)
+            .filter(|(_, (df, by_folder))| {
+                let top = by_folder.values().copied().max().unwrap_or(0);
+                *df >= threshold && (top as f64) < COMMON_CONCENTRATION * (*df as f64)
+            })
             .map(|(w, _)| w)
             .collect(),
     );
