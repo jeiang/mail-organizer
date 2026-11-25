@@ -15,7 +15,7 @@ use crate::similar;
 pub const SIMILAR_K: usize = 7;
 pub const SIMILAR_MIN_HITS: usize = 3;
 pub const SIMILAR_MIN_SHARE: f64 = 0.9;
-pub const MODEL_MIN: f64 = 0.9;
+pub const MODEL_MIN: f64 = 0.95;
 
 #[derive(Debug, Clone)]
 pub struct Decision {

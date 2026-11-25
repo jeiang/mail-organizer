@@ -14,9 +14,9 @@ use crate::db::json_list;
 use crate::rules::{MESSAGE_COLUMNS, Message};
 
 const BUCKETS: usize = 1 << 17;
-const EPOCHS: usize = 8;
-const RATE: f32 = 0.35;
-const L2: f32 = 1e-6;
+const EPOCHS: usize = 5;
+const RATE: f32 = 0.3;
+const L2: f32 = 1e-2;
 const SUBJECT_WORDS: usize = 24;
 const BODY_WORDS: usize = 48;
 const MIN_SAMPLES: usize = 20;
