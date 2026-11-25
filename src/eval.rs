@@ -14,12 +14,18 @@ pub struct Tally {
     pub correct: usize,
 }
 
+/// Confidence thresholds shown in the sweep.
+pub const SWEEP: [f64; 6] = [0.0, 0.5, 0.7, 0.8, 0.9, 0.95];
+
 #[derive(Debug, Default)]
 pub struct Report {
     pub total: usize,
     pub unfamiliar: usize,
     pub recurring: usize,
     pub by_stage: BTreeMap<&'static str, Tally>,
+    /// Stage, confidence, and whether the folder agreed, for every decided
+    /// message whose stage carries a confidence.
+    pub confident: Vec<(&'static str, f64, bool)>,
 }
 
 pub fn evaluate(c: &Connection, account: &str, limit: usize, use_similar: bool) -> Result<Report> {
@@ -46,10 +52,14 @@ pub fn evaluate(c: &Connection, account: &str, limit: usize, use_similar: bool) 
                 m.date_ts
             ))?;
             let d = router::decide(c, m, &rules, crate::db::now(), use_similar)?;
+            let correct = d.dest.is_some() && d.dest == m.folder;
             let tally = report.by_stage.entry(d.stage).or_default();
             tally.count += 1;
-            if d.dest.is_some() && d.dest == m.folder {
+            if correct {
                 tally.correct += 1;
+            }
+            if let Some(confidence) = d.confidence {
+                report.confident.push((d.stage, confidence, correct));
             }
             if d.action == "none" {
                 let known: bool = c.query_row(
@@ -115,6 +125,34 @@ pub fn print(account: &str, use_similar: bool, r: &Report) {
             t.count as f64 / r.total.max(1) as f64
         );
     }
+    if !r.confident.is_empty() {
+        println!(
+            "  {:<10} {:>5} {:>8} {:>6} {:>10} {:>9}",
+            "stage", "at P", "decided", "agree", "precision", "coverage"
+        );
+        let mut stages: Vec<&'static str> = r.confident.iter().map(|(s, _, _)| *s).collect();
+        stages.sort_unstable();
+        stages.dedup();
+        for stage in stages {
+            for at in SWEEP {
+                let (mut decided, mut correct) = (0, 0);
+                for (s, confidence, ok) in &r.confident {
+                    if *s == stage && *confidence >= at {
+                        decided += 1;
+                        correct += usize::from(*ok);
+                    }
+                }
+                if decided == 0 {
+                    continue;
+                }
+                println!(
+                    "  {stage:<10} {at:>5.2} {decided:>8} {correct:>6} {:>10.3} {:>9.3}",
+                    correct as f64 / decided as f64,
+                    decided as f64 / r.total.max(1) as f64
+                );
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -137,6 +175,12 @@ mod tests {
         let report = evaluate(&c, "test", 5, false).unwrap();
         assert_eq!(report.by_stage["none"].count, 3);
         assert_eq!(report.by_stage["learned"].correct, 2);
+        assert!(
+            report
+                .confident
+                .iter()
+                .any(|(stage, ..)| *stage == "learned")
+        );
         let count: i64 = c
             .query_row("SELECT COUNT(*) FROM training_messages", [], |r| r.get(0))
             .unwrap();
