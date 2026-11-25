@@ -787,7 +787,7 @@ async fn exception_summary(app: &App) -> Page {
             h2 { a href="/inbox" { "Inbox / needs review" } }
             @if counts.is_empty() { p { "Inbox is clear." } }
             @for c in &counts { p { (c[0]) ": " (c[1]) " in Inbox; " (c[2]) " unread, " (c[3]) " flagged. Oldest first seen " (when(&c[4])) "." } }
-            p { "Unread and flagged mail stays protected. Unmatched mail is reconsidered after each sync. Misc is manual-only and excluded from learning." }
+            p { "Unread and flagged mail stays protected. Unmatched mail is reconsidered after each sync. Misc is excluded from learning." }
             form method="post" action="/refresh" {
                 input type="hidden" name="csrf" value=(app.csrf.as_ref());
                 button type="submit" { "Refresh mail now" }
