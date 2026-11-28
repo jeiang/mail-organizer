@@ -619,6 +619,51 @@ pub fn learned_patterns(c: &Connection, account: &str) -> Result<Vec<Learned>> {
     Ok(out)
 }
 
+pub struct MoveSuggestion {
+    pub from_addr: String,
+    pub dest: String,
+    pub moved: usize,
+}
+
+/// Senders the owner moved out of the inbox, all of whose filed mail is in
+/// one folder, that no rule or learned pattern covers yet.
+pub fn move_suggestions(c: &Connection, account: &str) -> Result<Vec<MoveSuggestion>> {
+    let moved: Vec<(String, String, i64, i64)> = c
+        .prepare(
+            "SELECT m.from_addr, m.folder, COUNT(*), MAX(m.id) FROM training_messages m \
+             WHERE m.account = ?1 AND m.from_addr != '' \
+             AND (EXISTS (SELECT 1 FROM messages o WHERE o.account = m.account AND o.digest = m.digest \
+                  AND o.id != m.id AND o.in_inbox = 1) \
+               OR EXISTS (SELECT 1 FROM events e WHERE e.message_id = m.id AND e.kind = 'labels' \
+                  AND json_extract(e.detail, '$.in_inbox[0]') = 1 AND json_extract(e.detail, '$.in_inbox[1]') = 0)) \
+             AND NOT EXISTS (SELECT 1 FROM decisions d JOIN messages s ON s.id = d.message_id \
+                  WHERE s.account = m.account AND s.digest = m.digest AND d.apply_state = 'imported') \
+             AND (SELECT COUNT(DISTINCT t.folder) FROM training_messages t \
+                  WHERE t.account = m.account AND t.from_addr = m.from_addr) = 1 \
+             GROUP BY m.from_addr, m.folder ORDER BY COUNT(*) DESC",
+        )?
+        .query_map([account], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let rules = load(c, Some(account))?;
+    let now = crate::db::now();
+    let mut out = Vec::new();
+    for (from_addr, dest, n, id) in moved {
+        let m = c.query_row(
+            &format!("SELECT {MESSAGE_COLUMNS} FROM messages m WHERE m.id = ?1"),
+            [id],
+            Message::from_row,
+        )?;
+        if first_match(&m, &rules, now).is_none() && learned_match(c, &m)?.is_none() {
+            out.push(MoveSuggestion {
+                from_addr,
+                dest,
+                moved: n as usize,
+            });
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -592,24 +592,51 @@ async fn learned(State(app): State<App>) -> Page {
             let mut out = Vec::new();
             for a in rows(c, "SELECT name FROM accounts ORDER BY name", &[])? {
                 let patterns = rules::learned_patterns(c, &a[0])?;
-                out.push((a[0].clone(), patterns));
+                let moves = rules::move_suggestions(c, &a[0])?;
+                out.push((a[0].clone(), patterns, moves));
             }
             Ok(out)
         })
         .await?;
     let body = html! {
+        p { "“Make it a rule” saves the pattern as one of your rules, after the existing ones. Suggestions from your moves list senders you filed yourself that nothing covers yet." }
         p { "Sender patterns that file mail today: at least " (rules::MIN_N) " examples, " (rules::MIN_PURITY * 100.0) "% in one folder. Misc, duplicate copies, and known automatic filings are excluded. Imported examples are not independently verified." }
-        @for (account, patterns) in &groups {
+        @for (account, patterns, moves) in &groups {
             h2 { (account) " (" (patterns.len()) ")" }
+            @if !moves.is_empty() {
+                div class="table-wrapper" role="region" aria-label="Suggested from your moves" tabindex="0" { table { caption { "Suggested from your moves" }
+                    thead { tr { th scope="col" { "Sender" } th scope="col" { "Folder" } th scope="col" class="num" { "You moved" } th scope="col" { "Rule" } } } tbody {
+                    @for s in moves {
+                        tr { td { (s.from_addr) } td { (s.dest) } td class="num" { (s.moved) } td { (accept_form(&app, account, "addr", &serde_json::to_string(&[&s.from_addr])?, &s.dest)) } }
+                    }
+                } } }
+            }
             div class="table-wrapper" role="region" aria-label="Learned patterns" tabindex="0" { table { caption { "Learned patterns" }
-                thead { tr { th scope="col" { "Level" } th scope="col" { "Pattern" } th scope="col" { "Folder" } th scope="col" class="num" { "Messages" } th scope="col" class="num" { "Folder share" } th scope="col" { "Override" } } } tbody {
+                thead { tr { th scope="col" { "Level" } th scope="col" { "Pattern" } th scope="col" { "Folder" } th scope="col" class="num" { "Messages" } th scope="col" class="num" { "Folder share" } th scope="col" { "Rule" } } } tbody {
                 @for p in patterns {
-                    tr { td { (p.level) } td { (p.key) } td { (p.dest) } td class="num" { (p.n) } td class="num" { (format!("{:.2}", p.purity)) } td { a href={"/rules/edit?account=" (encode(account)) "&level=" (encode(p.level)) "&pattern=" (encode(&serde_json::to_string(&p.values)?))} { "Edit / override" } } }
+                    @let pattern = serde_json::to_string(&p.values)?;
+                    tr { td { (p.level) } td { (p.key) } td { (p.dest) } td class="num" { (p.n) } td class="num" { (format!("{:.2}", p.purity)) } td {
+                        (accept_form(&app, account, p.level, &pattern, &p.dest))
+                        a href={"/rules/edit?account=" (encode(account)) "&level=" (encode(p.level)) "&pattern=" (encode(&pattern))} { "Edit / override" }
+                    } }
                 }
             } } }
         }
     };
     layout(&app.db, "Learned patterns", body).await
+}
+
+fn accept_form(app: &App, account: &str, level: &str, pattern: &str, dest: &str) -> Markup {
+    html! {
+        form method="post" action="/rules/accept" {
+            input type="hidden" name="csrf" value=(app.csrf.as_ref());
+            input type="hidden" name="account" value=(account);
+            input type="hidden" name="level" value=(level);
+            input type="hidden" name="pattern" value=(pattern);
+            input type="hidden" name="dest" value=(dest);
+            button type="submit" { "Make it a rule" }
+        }
+    }
 }
 
 async fn rules_page(State(app): State<App>) -> Page {

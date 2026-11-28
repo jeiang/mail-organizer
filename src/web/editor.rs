@@ -9,6 +9,7 @@ pub(super) fn routes() -> Router<App> {
         .route("/rules/edit", get(edit))
         .route("/rules/preview", axum::routing::post(preview))
         .route("/rules/save", axum::routing::post(save))
+        .route("/rules/accept", axum::routing::post(accept))
 }
 
 #[derive(Deserialize, Default)]
@@ -230,6 +231,57 @@ async fn edit(State(app): State<App>, Query(q): Query<EditQuery>) -> Page {
         }
     }
     form_page(&app, &form, None).await
+}
+
+/// The file rule a learned pattern or suggestion stands for, with an id
+/// derived from it so accepting twice is refused.
+fn pattern_rule(account: &str, level: &str, pattern: &str, dest: &str) -> anyhow::Result<rules::Rule> {
+    let values: Vec<String> = serde_json::from_str(pattern)?;
+    let columns = rules::LEARNED_LEVELS
+        .iter()
+        .find(|(name, _)| *name == level)
+        .ok_or_else(|| anyhow::anyhow!("Unknown pattern level"))?
+        .1;
+    anyhow::ensure!(values.len() == columns.len(), "Invalid pattern");
+    let when: Vec<Value> = columns
+        .iter()
+        .zip(&values)
+        .map(|(field, v)| json!({"field": field, "op": "eq", "value": v}))
+        .collect();
+    Ok(rules::validate_rule(&json!({
+        "id": format!("learned-{}", &hex::encode(sha2::Sha256::digest(format!("{account}:{level}:{pattern}")))[..12]),
+        "account": account, "action": "file", "dest": dest, "when": when,
+    }))?)
+}
+
+/// Saves a suggested rule as is, after every existing rule.
+async fn accept(State(app): State<App>, Form(form): Form<BTreeMap<String, String>>) -> Response {
+    if !valid_csrf(&app, value(&form, "csrf")) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let result = async {
+        let rule = pattern_rule(
+            value(&form, "account"),
+            value(&form, "level"),
+            value(&form, "pattern"),
+            value(&form, "dest"),
+        )?;
+        let _mutation = app.db.mutations.lock().await;
+        app.db
+            .write(move |c| {
+                validate_scope(c, &rule)?;
+                let revision = rules::revision(c)?;
+                rules::save(c, rule, "", usize::MAX, &revision)
+            })
+            .await?;
+        app.db.refresh.send_replace(());
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    match result {
+        Ok(()) => Redirect::to("/rules").into_response(),
+        Err(e) => (StatusCode::CONFLICT, format!("Rule was not saved: {e}")).into_response(),
+    }
 }
 
 async fn preview(State(app): State<App>, Form(form): Form<BTreeMap<String, String>>) -> Response {
