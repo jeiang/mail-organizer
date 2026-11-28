@@ -81,6 +81,7 @@ pub fn router(db: Db, config: &Config) -> Router {
         .route("/refresh", axum::routing::post(refresh))
         .route("/retry/{id}", axum::routing::post(retry))
         .route("/folders/create", axum::routing::post(create_folder))
+        .route("/move/{id}", axum::routing::post(move_message))
         .merge(editor::routes())
         .layer(DefaultBodyLimit::max(65536))
         .layer(axum::middleware::from_fn_with_state(app.clone(), protect))
@@ -830,10 +831,25 @@ async fn exception_summary(app: &App) -> Page {
 }
 
 async fn inbox(State(app): State<App>) -> Page {
-    let messages = app.db.read(|c| rows(c,
+    let (messages, folders) = app.db.read(|c| {
+        let messages = rows(c,
         "SELECT m.id,m.account,m.date_ts,m.from_addr,m.subject,m.seen,m.flagged,d.id,d.stage,d.apply_state,d.apply_error,d.detail,m.first_seen
          FROM messages m LEFT JOIN decisions d ON d.id = (SELECT MAX(id) FROM decisions WHERE message_id = m.id)
-         WHERE m.gone_at IS NULL AND m.in_inbox = 1 AND m.sent = 0 ORDER BY m.first_seen,m.id", &[])).await?;
+         WHERE m.gone_at IS NULL AND m.in_inbox = 1 AND m.sent = 0 ORDER BY m.first_seen,m.id", &[])?;
+        let mut folders = BTreeMap::new();
+        for a in rows(c, "SELECT name FROM accounts", &[])? {
+            folders.insert(a[0].clone(), rules::destinations(c, &a[0])?);
+        }
+        Ok((messages, folders))
+    }).await?;
+    let move_form = |id: &str, folder: &str, create: bool, label: String| html! {
+        form method="post" action={"/move/" (id)} {
+            input type="hidden" name="csrf" value=(app.csrf.as_ref());
+            input type="hidden" name="folder" value=(folder);
+            @if create { input type="hidden" name="create" value="1"; }
+            button type="submit" { (label) }
+        }
+    };
     let body = html! {
         (exception_summary(&app).await?)
         p { "Account status updates every 15 seconds without changing forms or focus. " a href="/inbox" { "Reload this message list" } "." }
@@ -855,16 +871,39 @@ async fn inbox(State(app): State<App>) -> Page {
                         @else if m[8] == "none" {
                             (detail.get("reason").and_then(Value::as_str).unwrap_or("No confident match; reconsidered after each sync"))
                             @if let Some(model) = detail.get("model") { br; "Classifier: " (candidates(model)) }
+                            @if let Some(ai) = detail.get("ai") {
+                                br; "Local AI: " (ai.get("folder").and_then(Value::as_str).unwrap_or("no folder fits"))
+                                @if let Some(reason) = ai.get("reason").and_then(Value::as_str).filter(|r| !r.is_empty()) { " — " (reason) }
+                            }
                         }
                         @else if m[7].is_empty() { "Awaiting evaluation" }
                         @else { "Preview decision; no action queued" }
                     }
-                    td { @if m[9] == "failed" {
-                        form method="post" action={"/retry/" (m[7])} {
-                            input type="hidden" name="csrf" value=(app.csrf.as_ref());
-                            button type="submit" { "Retry with safety checks" }
+                    td {
+                        @if m[9] == "failed" {
+                            form method="post" action={"/retry/" (m[7])} {
+                                input type="hidden" name="csrf" value=(app.csrf.as_ref());
+                                button type="submit" { "Retry with safety checks" }
+                            }
                         }
-                    } }
+                        @if m[6] != "1" && m[9] != "pending" {
+                            @let ai = detail.get("ai");
+                            @if let Some(folder) = ai.and_then(|a| a.get("folder")).and_then(Value::as_str) {
+                                (move_form(&m[0], folder, false, format!("Move to {folder}")))
+                            }
+                            @if let Some(new) = ai.and_then(|a| a.get("suggestion")).and_then(Value::as_str) {
+                                (move_form(&m[0], new, true, format!("Create {new} and move")))
+                            }
+                            form method="post" action={"/move/" (m[0])} {
+                                input type="hidden" name="csrf" value=(app.csrf.as_ref());
+                                label for={"move-" (m[0])} { "Move to" }
+                                select id={"move-" (m[0])} name="folder" {
+                                    @for f in folders.get(&m[1]).into_iter().flatten() { option value=(f) { (f) } }
+                                }
+                                button type="submit" { "Move" }
+                            }
+                        }
+                    }
                 }
             } }
         } }
@@ -905,6 +944,88 @@ async fn create_folder(
         Err(e) => (
             StatusCode::UNPROCESSABLE_ENTITY,
             format!("Folder was not created: {e:#}"),
+        )
+            .into_response(),
+    }
+}
+
+/// Files one inbox message where the owner chose, creating the folder first
+/// when asked.
+async fn move_message(
+    State(app): State<App>,
+    Path(id): Path<i64>,
+    axum::Form(form): axum::Form<BTreeMap<String, String>>,
+) -> Response {
+    let field = |k: &str| form.get(k).map(String::as_str).unwrap_or_default();
+    if !valid_csrf(&app, field("csrf")) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let folder = field("folder").trim().to_owned();
+    let create = field("create") == "1";
+    let result = async {
+        let account: String = app
+            .db
+            .read(move |c| {
+                Ok(c.query_row(
+                    "SELECT account FROM messages WHERE id = ?1 AND in_inbox = 1 AND gone_at IS NULL AND sent = 0",
+                    [id],
+                    |r| r.get(0),
+                )?)
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("This message is no longer in the inbox."))?;
+        let Some(config) = app.accounts.iter().find(|a| a.name == account) else {
+            anyhow::bail!("Unknown account.");
+        };
+        anyhow::ensure!(
+            rules::filing_destination(&folder),
+            "{folder:?} is not a folder the sorter can file into."
+        );
+        if create {
+            crate::sync::create_folder(config, &folder).await?;
+        }
+        let _mutation = app.db.mutations.lock().await;
+        app.db
+            .write(move |c| {
+                if !create {
+                    anyhow::ensure!(
+                        rules::destinations(c, &account)?.contains(&folder),
+                        "{folder} does not exist in {account}."
+                    );
+                }
+                let m = c.query_row(
+                    &format!("SELECT {} FROM messages m WHERE m.id = ?1", rules::MESSAGE_COLUMNS),
+                    [id],
+                    rules::Message::from_row,
+                )?;
+                let tx = c.transaction()?;
+                tx.execute(
+                    "UPDATE decisions SET apply_state = 'skipped', apply_error = 'superseded'                      WHERE message_id = ?1 AND apply_state = 'pending'",
+                    [id],
+                )?;
+                let d = crate::router::Decision {
+                    stage: crate::apply::MANUAL,
+                    action: "file",
+                    dest: Some(folder),
+                    key: None,
+                    confidence: None,
+                    detail: serde_json::json!({}),
+                };
+                crate::router::record(&tx, &m, &d, db::now(), Some("pending"))?;
+                tx.commit()?;
+                Ok(())
+            })
+            .await
+    }
+    .await;
+    match result {
+        Ok(()) => {
+            app.db.refresh.send_replace(());
+            axum::response::Redirect::to("/inbox").into_response()
+        }
+        Err(e) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("Message was not moved: {e:#}"),
         )
             .into_response(),
     }

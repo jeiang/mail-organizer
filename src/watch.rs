@@ -52,13 +52,12 @@ pub async fn pass(
         }
         let mode = db.read(db::mode).await?;
         crate::metrics::live(&account.name, mode == Mode::Live);
-        let mut outcome = apply::Outcome::default();
         if mode == Mode::Live {
             apply::deletion_pass(db, account, false).await?;
-            outcome = apply::apply_account(db, imap, account, cap).await?;
-            if outcome.applied > 0 {
-                sync::sync_account(db, imap, account).await?;
-            }
+        }
+        let outcome = apply::apply_account(db, imap, account, cap).await?;
+        if outcome.applied > 0 {
+            sync::sync_account(db, imap, account).await?;
         }
         info!(
             account = %account.name,
@@ -114,9 +113,12 @@ async fn session(
         let name = account.name.clone();
         let queued = db
             .read(move |c| {
-                Ok(db::mode(c)? == Mode::Live && c.query_row(
-            "SELECT EXISTS(SELECT 1 FROM decisions WHERE account = ?1 AND apply_state = 'pending')",
-            [name], |r| r.get::<_, bool>(0))?)
+                let live = db::mode(c)? == Mode::Live;
+                Ok(c.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM decisions WHERE account = ?1 AND apply_state = 'pending' AND (?2 OR stage = ?3))",
+                    rusqlite::params![name, live, apply::MANUAL],
+                    |r| r.get::<_, bool>(0),
+                )?)
             })
             .await?;
         if queued {
