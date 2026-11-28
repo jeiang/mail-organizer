@@ -20,6 +20,10 @@ self: {
       service_name = cfg.telemetry.serviceName;
       sample_ratio = cfg.telemetry.sampleRatio;
     };
+    llm =
+      if cfg.llm.url == null
+      then null
+      else dropNulls {inherit (cfg.llm) url model;};
     account =
       lib.mapAttrsToList (name: a: {
         inherit name;
@@ -28,7 +32,7 @@ self: {
       })
       cfg.accounts;
   };
-  configFile = (pkgs.formats.toml {}).generate "mail-organizer.toml" settings;
+  configFile = (pkgs.formats.toml {}).generate "mail-organizer.toml" (dropNulls settings);
 in {
   options.services.mail-organizer = {
     enable = mkEnableOption "mail-organizer, which files read IMAP inbox mail into folders";
@@ -83,6 +87,24 @@ in {
       });
       default = {};
       description = "IMAP accounts, keyed by name. Names must stay stable: stored history refers to them.";
+    };
+
+    llm = {
+      url = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "http://127.0.0.1:8491";
+        description = ''
+          Base URL of an OpenAI-compatible chat server, such as llama-server,
+          that places mail no other stage could. Null: the stage is off.
+        '';
+      };
+
+      model = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        description = "Model name sent with each request and stored with each verdict. Null: `local`.";
+      };
     };
 
     telemetry = {
