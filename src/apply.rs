@@ -139,7 +139,12 @@ pub struct Outcome {
     pub failed: usize,
 }
 
-fn load_pending(c: &Connection, account: &str, cap: usize) -> Result<Vec<Pending>> {
+fn load_pending(
+    c: &Connection,
+    account: &str,
+    cap: usize,
+    manual_only: bool,
+) -> Result<Vec<Pending>> {
     let age_rules: HashSet<String> = rules::load(c, Some(account))?
         .into_iter()
         .filter(|r| r.has_age())
@@ -149,9 +154,9 @@ fn load_pending(c: &Connection, account: &str, cap: usize) -> Result<Vec<Pending
         "SELECT d.id, d.message_id, d.stage, d.action, d.dest, d.trace_id, d.span_id, d.key, \
          m.uid, m.uidvalidity, m.msgid, m.gone_at IS NOT NULL, mb.imap_name, mb.role, m.from_domain \
          FROM decisions d JOIN messages m ON m.id = d.message_id JOIN mailboxes mb ON mb.id = m.mailbox_id \
-         WHERE d.account = ?1 AND d.apply_state = 'pending' ORDER BY d.id LIMIT ?2",
+         WHERE d.account = ?1 AND d.apply_state = 'pending' AND (NOT ?3 OR d.stage = ?4) ORDER BY d.id LIMIT ?2",
     )?;
-    let rows = stmt.query_map(params![account, cap as i64], |r| {
+    let rows = stmt.query_map(params![account, cap as i64, manual_only, MANUAL], |r| {
         let stage: String = r.get(2)?;
         let key: Option<String> = r.get(7)?;
         let retention = stage == RETENTION;
@@ -223,6 +228,7 @@ pub async fn apply_account(
     imap: &mut Imap,
     account: &Account,
     cap: usize,
+    use_ai: bool,
 ) -> Result<Outcome> {
     let span = info_span!(
         "mail.apply",
@@ -232,7 +238,7 @@ pub async fn apply_account(
         failed = tracing::field::Empty,
     );
     let _mutation = db.mutations.lock().await;
-    let out = apply_inner(db, imap, account, cap)
+    let out = apply_inner(db, imap, account, cap, use_ai)
         .instrument(span.clone())
         .await?;
     span.record("applied", out.applied);
@@ -241,16 +247,21 @@ pub async fn apply_account(
     Ok(out)
 }
 
-async fn apply_inner(db: &Db, imap: &mut Imap, account: &Account, cap: usize) -> Result<Outcome> {
+async fn apply_inner(
+    db: &Db,
+    imap: &mut Imap,
+    account: &Account,
+    cap: usize,
+    use_ai: bool,
+) -> Result<Outcome> {
     let name = account.name.clone();
-    let (mode, pending) = db
-        .read(move |c| Ok((db::mode(c)?, load_pending(c, &name, cap)?)))
+    let pending = db
+        .read(move |c| {
+            let manual_only = db::mode(c)? != Mode::Live;
+            load_pending(c, &name, cap, manual_only)
+        })
         .await?;
     let mut out = Outcome::default();
-    let pending: Vec<Pending> = pending
-        .into_iter()
-        .filter(|p| mode == Mode::Live || p.stage == MANUAL)
-        .collect();
     if pending.is_empty() {
         return Ok(out);
     }
@@ -302,7 +313,15 @@ async fn apply_inner(db: &Db, imap: &mut Imap, account: &Account, cap: usize) ->
                             r.action == rules::Action::Delete && (m.seen || r.has_age())
                         })
                     } else {
-                        let d = router::decide(c, &m, &rules, db::now(), true, model.as_deref())?;
+                        let d = router::decide(
+                            c,
+                            &m,
+                            &rules,
+                            db::now(),
+                            true,
+                            model.as_deref(),
+                            use_ai,
+                        )?;
                         d.action == candidate.action && d.dest == candidate.dest
                     };
                     let detail: String = c.query_row(
@@ -772,7 +791,7 @@ mod tests {
             VALUES (1,'test',1,1,1,'message',1,1,1);
             INSERT INTO decisions(message_id,account,ts,stage,action,dest,apply_state)
             VALUES (1,'test',1,'learned','file','News','pending');").unwrap();
-        let pending = load_pending(&c, "test", 1).unwrap().remove(0);
+        let pending = load_pending(&c, "test", 1, false).unwrap().remove(0);
         assert_eq!(
             guard(
                 Preset::Icloud,

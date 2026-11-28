@@ -432,7 +432,7 @@ pub fn import(c: &mut Connection, document: &Value) -> Result<usize> {
 fn store(c: &Connection, rules: &[Rule]) -> Result<()> {
     c.execute(
         "UPDATE decisions SET apply_state = 'skipped', apply_error = 'rule_changed'
-        WHERE apply_state = 'pending'",
+        WHERE apply_state = 'pending' AND stage != 'manual'",
         [],
     )?;
     c.execute("DELETE FROM state WHERE key LIKE 'deletion:%'", [])?;

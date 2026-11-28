@@ -44,18 +44,18 @@ pub async fn pass(
     let started = std::time::Instant::now();
     let result = async {
         let synced = sync::sync_account(db, imap, account).await?;
-        let mut routed = router::route_account(db, &account.name).await?;
+        let mut routed = router::route_account(db, &account.name, llm.is_some()).await?;
         if let Some(llm) = llm
             && ai::consult(db, &account.name, llm).await? > 0
         {
-            routed = router::route_account(db, &account.name).await?;
+            routed = router::route_account(db, &account.name, true).await?;
         }
         let mode = db.read(db::mode).await?;
         crate::metrics::live(&account.name, mode == Mode::Live);
         if mode == Mode::Live {
             apply::deletion_pass(db, account, false).await?;
         }
-        let outcome = apply::apply_account(db, imap, account, cap).await?;
+        let outcome = apply::apply_account(db, imap, account, cap, llm.is_some()).await?;
         if outcome.applied > 0 {
             sync::sync_account(db, imap, account).await?;
         }

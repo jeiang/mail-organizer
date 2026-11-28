@@ -34,6 +34,7 @@ pub fn decide(
     now: f64,
     use_similar: bool,
     model: Option<&classify::Model>,
+    use_ai: bool,
 ) -> Result<Decision> {
     if let Some(rule) = rules::first_match(m, rules, now) {
         return Ok(Decision {
@@ -89,7 +90,11 @@ pub fn decide(
             }
         }
     }
-    if let Some(v) = crate::ai::latest(c, m.id)? {
+    if let Some(v) = use_ai
+        .then(|| crate::ai::latest(c, m.id))
+        .transpose()?
+        .flatten()
+    {
         if let (true, Some(dest)) = (v.confident, v.folder.clone()) {
             return Ok(Decision {
                 stage: "ai",
@@ -164,7 +169,8 @@ pub struct Routed {
     pub by_stage: std::collections::BTreeMap<&'static str, usize>,
 }
 
-pub async fn route_account(db: &Db, account: &str) -> Result<Routed> {
+/// Routes eligible mail; `use_ai` lets stored language model verdicts file.
+pub async fn route_account(db: &Db, account: &str, use_ai: bool) -> Result<Routed> {
     let span = info_span!(
         "mail.route",
         account,
@@ -199,7 +205,7 @@ pub async fn route_account(db: &Db, account: &str) -> Result<Routed> {
                     mail.confidence = tracing::field::Empty,
                 );
                 let _e = span.enter();
-                let mut d = decide(&tx, m, &rules, now, true, model.as_ref())?;
+                let mut d = decide(&tx, m, &rules, now, true, model.as_ref(), use_ai)?;
                 if d.action == "file" && !d.dest.as_ref().is_some_and(|dest| destinations.contains(dest)) {
                     d.detail = json!({"reason": "Destination is unavailable", "proposed": d.dest, "evidence": d.detail});
                     d.stage = "none";
@@ -275,13 +281,13 @@ mod tests {
     fn unmatched_mail_is_reconsidered_after_new_examples() {
         let c = fixture();
         let m = eligible(&c, "test").unwrap().remove(0);
-        let d = decide(&c, &m, &[], 1.0, false, None).unwrap();
+        let d = decide(&c, &m, &[], 1.0, false, None, false).unwrap();
         record(&c, &m, &d, 1.0, None).unwrap();
         examples(&c, "News", 2);
         let pending = eligible(&c, "test").unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(
-            decide(&c, &pending[0], &[], 2.0, false, None)
+            decide(&c, &pending[0], &[], 2.0, false, None, false)
                 .unwrap()
                 .dest
                 .as_deref(),

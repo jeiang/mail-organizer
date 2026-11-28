@@ -59,7 +59,15 @@ pub fn evaluate(c: &Connection, account: &str, limit: usize, use_similar: bool) 
                  CREATE TEMP VIEW training_messages AS SELECT * FROM main.training_messages WHERE date_ts < {};",
                 m.date_ts
             ))?;
-            let d = router::decide(c, m, &rules, crate::db::now(), use_similar, model.as_ref())?;
+            let d = router::decide(
+                c,
+                m,
+                &rules,
+                crate::db::now(),
+                use_similar,
+                model.as_ref(),
+                false,
+            )?;
             let correct = d.dest.is_some() && d.dest == m.folder;
             let tally = report.by_stage.entry(d.stage).or_default();
             tally.count += 1;

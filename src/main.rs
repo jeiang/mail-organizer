@@ -197,11 +197,12 @@ async fn run(command: Command, config: Config) -> Result<()> {
         }
         Command::Route { account } => {
             for account in config.select(account.as_deref())? {
-                let mut routed = router::route_account(&db, &account.name).await?;
+                let mut routed =
+                    router::route_account(&db, &account.name, config.llm.is_some()).await?;
                 if let Some(llm) = &config.llm
                     && ai::consult(&db, &account.name, llm).await? > 0
                 {
-                    routed = router::route_account(&db, &account.name).await?;
+                    routed = router::route_account(&db, &account.name, true).await?;
                 }
                 println!(
                     "{}: {} eligible, {:?}",
