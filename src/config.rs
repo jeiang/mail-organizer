@@ -18,6 +18,9 @@ pub struct Config {
     pub trace_url_template: String,
     #[serde(default)]
     pub telemetry: TelemetryConfig,
+    /// The local language model stage; off when absent.
+    #[serde(default)]
+    pub llm: Option<LlmConfig>,
     #[serde(default, rename = "account")]
     pub accounts: Vec<Account>,
 }
@@ -44,6 +47,20 @@ impl Default for TelemetryConfig {
             sample_ratio: default_sample_ratio(),
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LlmConfig {
+    /// Base URL of an OpenAI-compatible server, such as llama-server.
+    pub url: String,
+    /// Model name sent with each request and stored with each verdict.
+    #[serde(default = "default_llm_model")]
+    pub model: String,
+}
+
+fn default_llm_model() -> String {
+    "local".into()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]

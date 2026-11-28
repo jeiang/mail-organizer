@@ -9,6 +9,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../schema/0001_init.sql"),
     include_str!("../schema/0002_training.sql"),
     include_str!("../schema/0003_relay.sql"),
+    include_str!("../schema/0004_ai.sql"),
 ];
 
 /// Data rewrites that need Rust, run in the transaction of the migration

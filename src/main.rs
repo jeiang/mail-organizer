@@ -1,3 +1,4 @@
+mod ai;
 mod apply;
 mod classify;
 mod config;
@@ -64,6 +65,9 @@ enum Command {
         limit: usize,
         #[arg(long)]
         no_similar: bool,
+        /// Evaluate the language model alone (one request per message).
+        #[arg(long)]
+        ai: bool,
     },
     /// Export or import operator rules as JSON.
     Rules {
@@ -193,7 +197,12 @@ async fn run(command: Command, config: Config) -> Result<()> {
         }
         Command::Route { account } => {
             for account in config.select(account.as_deref())? {
-                let routed = router::route_account(&db, &account.name).await?;
+                let mut routed = router::route_account(&db, &account.name).await?;
+                if let Some(llm) = &config.llm
+                    && ai::consult(&db, &account.name, llm).await? > 0
+                {
+                    routed = router::route_account(&db, &account.name).await?;
+                }
                 println!(
                     "{}: {} eligible, {:?}",
                     account.name, routed.eligible, routed.by_stage
@@ -227,8 +236,18 @@ async fn run(command: Command, config: Config) -> Result<()> {
             account,
             limit,
             no_similar,
+            ai,
         } => {
             for account in config.select(account.as_deref())? {
+                if ai {
+                    let llm = config
+                        .llm
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("--ai needs [llm] in the config"))?;
+                    let report = ai::evaluate(&db, &account.name, limit, llm).await?;
+                    ai::print(&account.name, &report);
+                    continue;
+                }
                 let name = account.name.clone();
                 let report = db
                     .read(move |c| eval::evaluate(c, &name, limit, !no_similar))
@@ -277,7 +296,15 @@ async fn serve(db: Db, config: Config) -> Result<()> {
         .accounts
         .iter()
         .cloned()
-        .map(|a| tokio::spawn(watch::run(db.clone(), a, config.write_cap, stopped.clone())))
+        .map(|a| {
+            tokio::spawn(watch::run(
+                db.clone(),
+                a,
+                config.write_cap,
+                config.llm.clone(),
+                stopped.clone(),
+            ))
+        })
         .collect();
     let app = web::router(db.clone(), &config);
     let mut web_stopped = stopped.clone();

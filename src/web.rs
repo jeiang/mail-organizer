@@ -327,7 +327,7 @@ async fn activity(State(app): State<App>, Query(f): Query<ActivityQuery>) -> Pag
         (exception_summary(&app).await?)
         search { form method="get" action="/" {
             (select("account", &f.account, &account_refs))
-            (select("stage", &f.stage, &["operator", "learned", "model", "similar", "retention", "none", "knn", "llm", "correction", "fallback"]))
+            (select("stage", &f.stage, &["operator", "learned", "model", "similar", "ai", "manual", "retention", "none", "knn", "llm", "correction", "fallback"]))
             (select("agreement", &f.agreement, &["agree", "disagree", "pending", "gone"]))
             label for="folder" { "Destination folder" }
             input id="folder" name="folder" value=[nonblank(&f.folder)];
@@ -688,6 +688,8 @@ fn stage_label(stage: &str) -> &str {
         "learned" => "Learned pattern",
         "model" => "Classifier",
         "similar" => "Similar mail",
+        "ai" => "Local AI",
+        "manual" => "Your move",
         "retention" => "Retention rule",
         "none" => "Needs review",
         "knn" => "Similar mail (imported)",

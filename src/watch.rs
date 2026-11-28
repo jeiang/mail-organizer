@@ -8,8 +8,9 @@ use tokio::sync::watch;
 use tokio::time::Instant;
 use tracing::{Instrument, error, info, info_span, warn};
 
+use crate::ai;
 use crate::apply;
-use crate::config::Account;
+use crate::config::{Account, LlmConfig};
 use crate::db::{self, Db, Mode};
 use crate::imap::Imap;
 use crate::router;
@@ -36,13 +37,19 @@ pub async fn pass(
     imap: &mut Imap,
     account: &Account,
     cap: usize,
+    llm: Option<&LlmConfig>,
     trigger: &str,
 ) -> Result<()> {
     let span = info_span!(parent: None, "mail.pass", account = %account.name, trigger);
     let started = std::time::Instant::now();
     let result = async {
         let synced = sync::sync_account(db, imap, account).await?;
-        let routed = router::route_account(db, &account.name).await?;
+        let mut routed = router::route_account(db, &account.name).await?;
+        if let Some(llm) = llm
+            && ai::consult(db, &account.name, llm).await? > 0
+        {
+            routed = router::route_account(db, &account.name).await?;
+        }
         let mode = db.read(db::mode).await?;
         crate::metrics::live(&account.name, mode == Mode::Live);
         let mut outcome = apply::Outcome::default();
@@ -93,6 +100,7 @@ async fn session(
     db: &Db,
     account: &Account,
     cap: usize,
+    llm: Option<&LlmConfig>,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<()> {
     let mut imap = Imap::connect(account).await?;
@@ -102,7 +110,7 @@ async fn session(
         // Baseline before the pass, so mail read while it runs triggers the next one.
         imap.select(INBOX).await?;
         let mut readable = imap.uid_search(READABLE).await?;
-        pass(db, &mut imap, account, cap, trigger).await?;
+        pass(db, &mut imap, account, cap, llm, trigger).await?;
         let name = account.name.clone();
         let queued = db
             .read(move |c| {
@@ -144,11 +152,17 @@ async fn session(
     }
 }
 
-pub async fn run(db: Db, account: Account, cap: usize, mut shutdown: watch::Receiver<bool>) {
+pub async fn run(
+    db: Db,
+    account: Account,
+    cap: usize,
+    llm: Option<LlmConfig>,
+    mut shutdown: watch::Receiver<bool>,
+) {
     let mut backoff = BACKOFF_START;
     while !*shutdown.borrow() {
         let started = Instant::now();
-        match session(&db, &account, cap, &mut shutdown).await {
+        match session(&db, &account, cap, llm.as_ref(), &mut shutdown).await {
             Ok(()) => break,
             Err(e) => {
                 if started.elapsed() >= HEALTHY_RESET {

@@ -1,6 +1,6 @@
 //! Routing: operator rules, then learned sender patterns, then the per-account
-//! classifier, then the BM25 neighbour vote. Anything else stays in the inbox
-//! for the owner to move.
+//! classifier, then the BM25 neighbour vote, then a stored language model
+//! verdict. Anything else stays in the inbox for the owner to move.
 
 use anyhow::Result;
 use rusqlite::{Connection, params};
@@ -88,6 +88,19 @@ pub fn decide(
                 });
             }
         }
+    }
+    if let Some(v) = crate::ai::latest(c, m.id)? {
+        if let (true, Some(dest)) = (v.confident, v.folder.clone()) {
+            return Ok(Decision {
+                stage: "ai",
+                action: "file",
+                dest: Some(dest),
+                key: None,
+                confidence: None,
+                detail: json!({"ai": v}),
+            });
+        }
+        detail["ai"] = json!(v);
     }
     Ok(Decision {
         stage: "none",
