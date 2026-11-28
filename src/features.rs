@@ -129,10 +129,17 @@ pub const RELAY_DOMAIN: &str = "privaterelay.appleid.com";
 /// The original sender's domain behind an Apple Private Relay address, which
 /// iCloud writes as `<local>_at_<domain with _ for .>_<10 chars>_<8 hex>@privaterelay.appleid.com`.
 pub fn relay_domain(addr: &str) -> Option<String> {
-    let local = addr.to_lowercase().strip_suffix(&format!("@{RELAY_DOMAIN}"))?.to_owned();
+    let local = addr
+        .to_lowercase()
+        .strip_suffix(&format!("@{RELAY_DOMAIN}"))?
+        .to_owned();
     let (rest, tag) = local.rsplit_once('_')?;
     let (rest, id) = rest.rsplit_once('_')?;
-    if tag.len() != 8 || !tag.bytes().all(|b| b.is_ascii_hexdigit()) || id.len() != 10 || !id.bytes().all(|b| b.is_ascii_alphanumeric()) {
+    if tag.len() != 8
+        || !tag.bytes().all(|b| b.is_ascii_hexdigit())
+        || id.len() != 10
+        || !id.bytes().all(|b| b.is_ascii_alphanumeric())
+    {
         return None;
     }
     let (_, domain) = rest.split_once("_at_")?;
@@ -141,7 +148,9 @@ pub fn relay_domain(addr: &str) -> Option<String> {
         && !domain.starts_with('.')
         && !domain.ends_with('.')
         && !domain.contains("..")
-        && domain.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-'))
+        && domain
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-'))
     .then_some(domain)
 }
 
@@ -410,7 +419,9 @@ Content-Type: text/plain\r\n\r\n";
     #[test]
     fn private_relay_domains() {
         assert_eq!(
-            sender_domain("newsletter_at_service_tiktok_com_zws2fx45wv_30ff5975@privaterelay.appleid.com"),
+            sender_domain(
+                "newsletter_at_service_tiktok_com_zws2fx45wv_30ff5975@privaterelay.appleid.com"
+            ),
             "service.tiktok.com"
         );
         assert_eq!(

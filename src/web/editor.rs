@@ -235,7 +235,12 @@ async fn edit(State(app): State<App>, Query(q): Query<EditQuery>) -> Page {
 
 /// The file rule a learned pattern or suggestion stands for, with an id
 /// derived from it so accepting twice is refused.
-fn pattern_rule(account: &str, level: &str, pattern: &str, dest: &str) -> anyhow::Result<rules::Rule> {
+fn pattern_rule(
+    account: &str,
+    level: &str,
+    pattern: &str,
+    dest: &str,
+) -> anyhow::Result<rules::Rule> {
     let values: Vec<String> = serde_json::from_str(pattern)?;
     let columns = rules::LEARNED_LEVELS
         .iter()

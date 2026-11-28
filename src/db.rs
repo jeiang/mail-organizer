@@ -18,11 +18,16 @@ fn backfill(tx: &Connection, version: usize) -> Result<()> {
     if version == 3 {
         let relayed: Vec<(i64, String)> = tx
             .prepare("SELECT id, from_addr FROM messages WHERE from_domain = ?1")?
-            .query_map([crate::features::RELAY_DOMAIN], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .query_map([crate::features::RELAY_DOMAIN], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })?
             .collect::<rusqlite::Result<_>>()?;
         for (id, addr) in relayed {
             if let Some(domain) = crate::features::relay_domain(&addr) {
-                tx.execute("UPDATE messages SET from_domain = ?1 WHERE id = ?2", params![domain, id])?;
+                tx.execute(
+                    "UPDATE messages SET from_domain = ?1 WHERE id = ?2",
+                    params![domain, id],
+                )?;
                 crate::sync::reindex_one(tx, id)?;
             }
         }

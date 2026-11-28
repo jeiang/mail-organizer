@@ -869,12 +869,14 @@ async fn inbox(State(app): State<App>) -> Page {
         }
         Ok((messages, folders))
     }).await?;
-    let move_form = |id: &str, folder: &str, create: bool, label: String| html! {
-        form method="post" action={"/move/" (id)} {
-            input type="hidden" name="csrf" value=(app.csrf.as_ref());
-            input type="hidden" name="folder" value=(folder);
-            @if create { input type="hidden" name="create" value="1"; }
-            button type="submit" { (label) }
+    let move_form = |id: &str, folder: &str, create: bool, label: String| {
+        html! {
+            form method="post" action={"/move/" (id)} {
+                input type="hidden" name="csrf" value=(app.csrf.as_ref());
+                input type="hidden" name="folder" value=(folder);
+                @if create { input type="hidden" name="create" value="1"; }
+                button type="submit" { (label) }
+            }
         }
     };
     let body = html! {

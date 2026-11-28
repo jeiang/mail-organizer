@@ -67,12 +67,26 @@ pub fn folders(c: &Connection, account: &str, before: Option<f64>) -> Result<Fol
         lines.push(format!("- {name}"));
         let examples = stmt.query_map(
             params![account, name, before.unwrap_or(f64::MAX), EXAMPLES as i64],
-            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)),
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            },
         )?;
         for e in examples {
             let (from_name, from_addr, subject) = e?;
-            let sender = if from_name.is_empty() { from_addr } else { from_name };
-            lines.push(format!("    {} — {}", prefix(&sender, 60), prefix(&subject, 100)));
+            let sender = if from_name.is_empty() {
+                from_addr
+            } else {
+                from_name
+            };
+            lines.push(format!(
+                "    {} — {}",
+                prefix(&sender, 60),
+                prefix(&subject, 100)
+            ));
         }
     }
     let prompt = format!(
@@ -94,7 +108,10 @@ pub fn folders(c: &Connection, account: &str, before: Option<f64>) -> Result<Fol
 }
 
 fn describe(m: &Message, body: &str) -> String {
-    let mut out = format!("From: {} <{}>\nSender domain: {}\n", m.from_name, m.from_addr, m.from_domain);
+    let mut out = format!(
+        "From: {} <{}>\nSender domain: {}\n",
+        m.from_name, m.from_addr, m.from_domain
+    );
     for (label, value) in [
         ("List-Id", &m.list_id),
         ("Precedence", &m.precedence),
@@ -108,7 +125,11 @@ fn describe(m: &Message, body: &str) -> String {
     if !attachments.is_empty() {
         out.push_str(&format!("Attachments: {}\n", attachments.join(", ")));
     }
-    out.push_str(&format!("Subject: {}\n\n{}", m.subject, prefix(body, BODY_CHARS)));
+    out.push_str(&format!(
+        "Subject: {}\n\n{}",
+        m.subject,
+        prefix(body, BODY_CHARS)
+    ));
     out
 }
 
@@ -158,7 +179,9 @@ pub async fn ask(
     parse(content, &folders.names).with_context(|| {
         format!(
             "finish reason {}, answer {content:?}",
-            response.pointer("/choices/0/finish_reason").unwrap_or(&Value::Null)
+            response
+                .pointer("/choices/0/finish_reason")
+                .unwrap_or(&Value::Null)
         )
     })
 }
@@ -166,10 +189,18 @@ pub async fn ask(
 /// The model's answer, checked against the folders it was offered.
 fn parse(content: &str, names: &[String]) -> Result<Verdict> {
     let answer: Value = serde_json::from_str(content).context("the model's answer is not JSON")?;
-    let text = |k: &str| answer.get(k).and_then(Value::as_str).unwrap_or_default().trim();
+    let text = |k: &str| {
+        answer
+            .get(k)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+    };
     let folder = names.iter().find(|n| n.as_str() == text("folder")).cloned();
     let suggestion = Some(text("new_folder"))
-        .filter(|s| rules::filing_destination(s) && !names.iter().any(|n| n.eq_ignore_ascii_case(s)))
+        .filter(|s| {
+            rules::filing_destination(s) && !names.iter().any(|n| n.eq_ignore_ascii_case(s))
+        })
         .map(String::from);
     Ok(Verdict {
         confident: folder.is_some() && text("fit") == "strong",
@@ -238,7 +269,11 @@ pub async fn consult(db: &Db, account: &str, llm: &LlmConfig) -> Result<usize> {
             // The server may be loading or down; what was answered is kept
             // and the rest is asked next pass.
             Err(e) => {
-                warn!(account, message.id = m.id, "language model unavailable: {e:#}");
+                warn!(
+                    account,
+                    message.id = m.id,
+                    "language model unavailable: {e:#}"
+                );
                 break;
             }
         }
