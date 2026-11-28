@@ -23,6 +23,16 @@ const EXAMPLES: usize = 3;
 const BODY_CHARS: usize = 1500;
 const TIMEOUT: Duration = Duration::from_secs(120);
 const NONE: &str = "(none)";
+const KINDS: [&str; 8] = [
+    "personal",
+    "receipt, order or bill",
+    "account or security notice",
+    "service update",
+    "newsletter",
+    "promotion",
+    "social notification",
+    "other",
+];
 
 /// The account's folders and the system prompt describing them.
 pub struct Folders {
@@ -68,10 +78,13 @@ pub fn folders(c: &Connection, account: &str, before: Option<f64>) -> Result<Fol
     let prompt = format!(
         "You file the owner's email into their folders. Their folders, each with up to {EXAMPLES} recent examples (sender — subject):\n\
          {}\n\n\
-         Choose the one folder this message belongs in, judging by what each folder holds. \
-         Answer \"{NONE}\" when no folder fits. \
-         Set confident to true only when the folder clearly fits the sender or the purpose of the message. \
-         When no folder fits well, set new_folder to a short name for a folder the owner could create for this kind of mail \
+         First name the kind of message. Then choose the folder it belongs in and grade the fit:\n\
+         - strong: the folder holds mail of this kind for this purpose, for example from the same sender, or it is named for exactly this kind of mail.\n\
+         - weak: the folder is only related by topic or by the sender's industry. A sale offer from a company whose receipts or release notes \
+         are in a folder is a weak fit for that folder.\n\
+         - none: no folder fits; answer \"{NONE}\".\n\
+         Marketing, promotions and social network notifications fit strongly only in folders that hold such mail. \
+         Unless the fit is strong, set new_folder to a short name for a folder the owner could create for this kind of mail \
          (for example Promotions or Social), in the style of the existing names, using / for subfolders; otherwise leave it empty. \
          Keep reason to one short sentence.",
         lines.join("\n")
@@ -109,32 +122,29 @@ pub async fn ask(
 ) -> Result<Verdict> {
     let mut choices: Vec<&str> = folders.names.iter().map(String::as_str).collect();
     choices.push(NONE);
-    let schema = json!({
-        "type": "object",
-        "properties": {
-            "reason": {"type": "string", "maxLength": 200},
-            "folder": {"enum": choices},
-            "confident": {"type": "boolean"},
-            "new_folder": {"type": "string", "maxLength": 60},
-        },
-        "required": ["reason", "folder", "confident", "new_folder"],
-        "additionalProperties": false,
-    });
-    let request = json!({
-        "model": llm.model,
-        "temperature": 0,
-        "max_tokens": 300,
-        "messages": [
-            {"role": "system", "content": folders.prompt},
-            {"role": "user", "content": describe(m, body)},
-        ],
-        "response_format": {"type": "json_schema", "json_schema": {"name": "verdict", "strict": true, "schema": schema}},
-    });
+    // Written by hand because serde_json sorts keys, and the grammar follows
+    // property order: the model must state kind and reason before choosing.
+    let schema = format!(
+        r#"{{"type":"object","properties":{{"kind":{{"enum":{}}},"reason":{{"type":"string","maxLength":200}},"folder":{{"enum":{}}},"fit":{{"enum":["strong","weak","none"]}},"new_folder":{{"type":"string","maxLength":60}}}},"required":["kind","reason","folder","fit","new_folder"],"additionalProperties":false}}"#,
+        json!(KINDS),
+        json!(choices),
+    );
+    let messages = json!([
+        {"role": "system", "content": folders.prompt},
+        {"role": "user", "content": describe(m, body)},
+    ]);
+    // reasoning_format none: llama-server otherwise lets a model write free
+    // text before the constrained answer.
+    let request = format!(
+        r#"{{"model":{},"temperature":0,"max_tokens":300,"reasoning_format":"none","messages":{messages},"response_format":{{"type":"json_schema","json_schema":{{"name":"verdict","strict":true,"schema":{schema}}}}}}}"#,
+        json!(llm.model),
+    );
     let url = format!("{}/v1/chat/completions", llm.url.trim_end_matches('/'));
     let response: Value = client
         .post(&url)
         .timeout(TIMEOUT)
-        .json(&request)
+        .header(reqwest::header::CONTENT_TYPE, "application/json")
+        .body(request)
         .send()
         .await
         .with_context(|| format!("asking {url}"))?
@@ -145,7 +155,12 @@ pub async fn ask(
         .pointer("/choices/0/message/content")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("no message content in the model's response"))?;
-    parse(content, &folders.names)
+    parse(content, &folders.names).with_context(|| {
+        format!(
+            "finish reason {}, answer {content:?}",
+            response.pointer("/choices/0/finish_reason").unwrap_or(&Value::Null)
+        )
+    })
 }
 
 /// The model's answer, checked against the folders it was offered.
@@ -157,7 +172,7 @@ fn parse(content: &str, names: &[String]) -> Result<Verdict> {
         .filter(|s| rules::filing_destination(s) && !names.iter().any(|n| n.eq_ignore_ascii_case(s)))
         .map(String::from);
     Ok(Verdict {
-        confident: folder.is_some() && answer.get("confident").and_then(Value::as_bool) == Some(true),
+        confident: folder.is_some() && text("fit") == "strong",
         folder,
         suggestion,
         reason: text("reason").to_owned(),
@@ -333,7 +348,7 @@ mod tests {
     fn answers_are_checked_against_the_offered_folders() {
         let names = vec!["News".to_owned(), "Purchases".to_owned()];
         let v = parse(
-            r#"{"reason":"shop","folder":"Purchases","confident":true,"new_folder":""}"#,
+            r#"{"reason":"shop","folder":"Purchases","fit":"strong","new_folder":""}"#,
             &names,
         )
         .unwrap();
@@ -341,15 +356,21 @@ mod tests {
         assert!(v.confident);
         assert!(v.suggestion.is_none());
         let v = parse(
-            r#"{"reason":"x","folder":"Trash","confident":true,"new_folder":"Promotions"}"#,
+            r#"{"reason":"x","folder":"Trash","fit":"strong","new_folder":"Promotions"}"#,
             &names,
         )
         .unwrap();
         assert!(v.folder.is_none() && !v.confident);
         assert_eq!(v.suggestion.as_deref(), Some("Promotions"));
+        let v = parse(
+            r#"{"reason":"sale","folder":"Purchases","fit":"weak","new_folder":""}"#,
+            &names,
+        )
+        .unwrap();
+        assert!(v.folder.is_some() && !v.confident);
         for bad in ["INBOX", "news", "Misc/Old", "Trash"] {
             let v = parse(
-                &format!(r#"{{"reason":"","folder":"(none)","confident":false,"new_folder":"{bad}"}}"#),
+                &format!(r#"{{"reason":"","folder":"(none)","fit":"none","new_folder":"{bad}"}}"#),
                 &names,
             )
             .unwrap();
