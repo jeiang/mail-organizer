@@ -124,6 +124,41 @@ pub fn subject_template(subject: &str) -> String {
     sub(&SPACE, " ", &s).trim().to_owned()
 }
 
+pub const RELAY_DOMAIN: &str = "privaterelay.appleid.com";
+
+/// The original sender's domain behind an Apple Private Relay address, which
+/// iCloud writes as `<local>_at_<domain with _ for .>_<10 chars>_<8 hex>@privaterelay.appleid.com`.
+pub fn relay_domain(addr: &str) -> Option<String> {
+    let local = addr
+        .to_lowercase()
+        .strip_suffix(&format!("@{RELAY_DOMAIN}"))?
+        .to_owned();
+    let (rest, tag) = local.rsplit_once('_')?;
+    let (rest, id) = rest.rsplit_once('_')?;
+    if tag.len() != 8
+        || !tag.bytes().all(|b| b.is_ascii_hexdigit())
+        || id.len() != 10
+        || !id.bytes().all(|b| b.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+    let (_, domain) = rest.split_once("_at_")?;
+    let domain = domain.replace('_', ".");
+    (domain.contains('.')
+        && !domain.starts_with('.')
+        && !domain.ends_with('.')
+        && !domain.contains("..")
+        && domain
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-'))
+    .then_some(domain)
+}
+
+/// The sender's domain, looking through Apple Private Relay.
+pub fn sender_domain(addr: &str) -> String {
+    relay_domain(addr).unwrap_or_else(|| domain_of(addr))
+}
+
 pub fn domain_of(addr: &str) -> String {
     match addr.rfind('@') {
         Some(i) => addr[i + 1..]
@@ -306,7 +341,7 @@ pub fn extract(header: &[u8], text: &[u8], fallback_ts: f64) -> Features {
         msgid_domain: domain_of(&msgid),
         msgid,
         date_ts,
-        from_domain: domain_of(&from_addr),
+        from_domain: sender_domain(&from_addr),
         from_addr,
         from_name,
         to_addrs: to.into_iter().collect(),
@@ -379,6 +414,30 @@ Content-Type: text/plain\r\n\r\n";
         assert_eq!(f.subject_tmpl, "your order <n>");
         assert_eq!(f.date_ts, 7.0);
         assert_eq!(f.body, "Thanks for your <b>order</b>.");
+    }
+
+    #[test]
+    fn private_relay_domains() {
+        assert_eq!(
+            sender_domain(
+                "newsletter_at_service_tiktok_com_zws2fx45wv_30ff5975@privaterelay.appleid.com"
+            ),
+            "service.tiktok.com"
+        );
+        assert_eq!(
+            sender_domain("Team_at_my-shop_co_uk_ht74v8v5pj_01d4f950@PrivateRelay.AppleID.com"),
+            "my-shop.co.uk"
+        );
+        for odd in [
+            "plain@privaterelay.appleid.com",
+            "x_at_example_com_short_01d4f950@privaterelay.appleid.com",
+            "x_at_example_com_ht74v8v5pj_nothex!!@privaterelay.appleid.com",
+            "x_at__ht74v8v5pj_01d4f950@privaterelay.appleid.com",
+            "x_at_com_ht74v8v5pj_01d4f950@privaterelay.appleid.com",
+        ] {
+            assert_eq!(sender_domain(odd), RELAY_DOMAIN, "{odd}");
+        }
+        assert_eq!(sender_domain("a@b.example"), "b.example");
     }
 
     #[test]

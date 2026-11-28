@@ -58,6 +58,7 @@
                 services.mail-organizer = {
                   enable = true;
                   telemetry.enable = true;
+                  llm.url = "http://127.0.0.1:8491";
                   accounts.icloud = {
                     preset = "icloud";
                     login = "a@example.com";

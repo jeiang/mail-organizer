@@ -1049,6 +1049,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "regex",
+ "reqwest",
  "rusqlite",
  "rustls",
  "serde",
