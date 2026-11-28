@@ -47,6 +47,7 @@ struct App {
     trace_url: Arc<str>,
     csrf: Arc<str>,
     listen_host: Arc<str>,
+    accounts: Arc<[crate::config::Account]>,
 }
 
 pub fn router(db: Db, config: &Config) -> Router {
@@ -65,6 +66,7 @@ pub fn router(db: Db, config: &Config) -> Router {
             .unwrap_or_else(|_| "127.0.0.1".into())
             .into(),
         trace_url: config.trace_url_template.as_str().into(),
+        accounts: config.accounts.clone().into(),
     };
     Router::new()
         .route("/", get(activity))
@@ -78,6 +80,7 @@ pub fn router(db: Db, config: &Config) -> Router {
         .route("/status.js", get(status_script))
         .route("/refresh", axum::routing::post(refresh))
         .route("/retry/{id}", axum::routing::post(retry))
+        .route("/folders/create", axum::routing::post(create_folder))
         .merge(editor::routes())
         .layer(DefaultBodyLimit::max(65536))
         .layer(axum::middleware::from_fn_with_state(app.clone(), protect))
@@ -407,6 +410,16 @@ async fn folders(State(app): State<App>) -> Page {
         })
         .await?;
     let body = html! {
+        form method="post" action="/folders/create" {
+            input type="hidden" name="csrf" value=(app.csrf.as_ref());
+            label for="new-account" { "Account" }
+            select id="new-account" name="account" {
+                @for a in app.accounts.iter() { option value=(a.name) { (a.name) } }
+            }
+            label for="new-name" { "New folder (use / for subfolders)" }
+            input id="new-name" name="name" required maxlength="200";
+            button type="submit" { "Create folder" }
+        }
         p { "Decisions are counted by stage over the last 7 and 30 days; differences compare the chosen folder with the current location." }
         div class="table-wrapper" role="region" aria-label="Folder overview" tabindex="0" { table { caption { "Folder overview" }
             thead { tr { th scope="col" { "Account" } th scope="col" { "Folder" } th scope="col" class="num" { "Filed" } th scope="col" { "Decided into it (7d / 30d)" } th scope="col" class="num" { "Disagreements" } } } tbody {
@@ -869,6 +882,30 @@ async fn refresh(
     }
     app.db.refresh.send_replace(());
     axum::response::Redirect::to("/inbox").into_response()
+}
+
+async fn create_folder(
+    State(app): State<App>,
+    axum::Form(form): axum::Form<BTreeMap<String, String>>,
+) -> Response {
+    let field = |k: &str| form.get(k).map(String::as_str).unwrap_or_default();
+    if !valid_csrf(&app, field("csrf")) {
+        return StatusCode::FORBIDDEN.into_response();
+    }
+    let Some(account) = app.accounts.iter().find(|a| a.name == field("account")) else {
+        return (StatusCode::UNPROCESSABLE_ENTITY, "Unknown account.").into_response();
+    };
+    match crate::sync::create_folder(account, field("name").trim()).await {
+        Ok(_) => {
+            app.db.refresh.send_replace(());
+            axum::response::Redirect::to("/folders").into_response()
+        }
+        Err(e) => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("Folder was not created: {e:#}"),
+        )
+            .into_response(),
+    }
 }
 
 async fn retry(

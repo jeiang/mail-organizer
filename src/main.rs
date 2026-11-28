@@ -72,6 +72,12 @@ enum Command {
     },
     /// Show or set the mode (shadow decides only; live also moves mail).
     Mode { mode: Option<String> },
+    /// Create a folder (a label on Gmail) on the server.
+    Folder {
+        #[arg(long)]
+        account: String,
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -157,6 +163,14 @@ async fn run(command: Command, config: Config) -> Result<()> {
                     stats.flag_changes,
                     stats.mailboxes
                 );
+            }
+        }
+        Command::Folder { account, name } => {
+            let account = config.account(&account)?;
+            if sync::create_folder(account, &name).await? {
+                println!("{}: created {name}", account.name);
+            } else {
+                println!("{}: {name} already exists", account.name);
             }
         }
         Command::Rules {

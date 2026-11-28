@@ -263,6 +263,27 @@ async fn sync_inner(db: &Db, imap: &mut Imap, account: &Account) -> Result<Stats
     Ok(stats)
 }
 
+/// Creates a filing folder on the server, which the next sync picks up.
+/// Returns false when it already exists.
+pub async fn create_folder(account: &Account, name: &str) -> Result<bool> {
+    anyhow::ensure!(
+        rules::filing_destination(name),
+        "{name:?} is not a folder the sorter can file into"
+    );
+    let mut imap = Imap::connect(account).await?;
+    let result = async {
+        if imap.list().await?.iter().any(|m| m.name == name) {
+            return Ok(false);
+        }
+        imap.create(name).await?;
+        info!(account = %account.name, folder = name, "folder created");
+        Ok(true)
+    }
+    .await;
+    imap.logout().await;
+    result
+}
+
 fn retire_mailboxes(
     c: &mut Connection,
     account: &str,

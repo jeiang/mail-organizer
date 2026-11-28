@@ -1,5 +1,5 @@
 //! A thin IMAP client over async-imap: LIST, STATUS, SELECT, SEARCH, FETCH,
-//! MOVE, Gmail label STORE and IDLE. Every network step has a timeout, so a
+//! CREATE, MOVE, Gmail label STORE and IDLE. Every network step has a timeout, so a
 //! dead connection fails the pass instead of hanging it.
 
 use std::collections::HashSet;
@@ -344,6 +344,11 @@ impl Imap {
             out = self.uid_fetch(&uid_set(uids), &query).await?;
         }
         Ok(out)
+    }
+
+    /// Creates a mailbox (a label on Gmail) named by its decoded name.
+    pub async fn create(&mut self, name: &str) -> Result<()> {
+        timed(&format!("CREATE {name}"), self.session.create(utf7::encode(name))).await
     }
 
     pub async fn uid_move(&mut self, uids: &[u32], dest_imap: &str) -> Result<()> {
